@@ -78,6 +78,74 @@ namespace GitHub.Runner.Common.Tests.Util
             Assert.True(char.IsUpper(result[0]),
                 $"Expected uppercase drive letter but got: {result}");
         }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public void GetCanonicalPath_NormalizesFolderCasing_OnWindows()
+        {
+            // Create a directory with known casing, then query with wrong casing
+            var basePath = Path.GetTempPath();
+            if (basePath.StartsWith(@"\\"))
+            {
+                return; // Skip UNC
+            }
+
+            var realName = "PathUtilTest_MiXeDcAsE_" + Path.GetRandomFileName();
+            var realDir = Path.Combine(basePath, realName);
+            try
+            {
+                Directory.CreateDirectory(realDir);
+
+                // Query with all-lowercase version
+                var wrongCased = Path.Combine(basePath, realName.ToLowerInvariant());
+
+                var result = PathUtil.GetCanonicalPath(wrongCased);
+
+                // The canonical result should contain the original mixed-case name
+                Assert.Contains(realName, result);
+            }
+            finally
+            {
+                if (Directory.Exists(realDir))
+                {
+                    Directory.Delete(realDir);
+                }
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public void GetCanonicalPath_IsIdempotent_OnWindows()
+        {
+            // Calling GetCanonicalPath twice should return the same result
+            var tempDir = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
+            var first = PathUtil.GetCanonicalPath(tempDir);
+            var second = PathUtil.GetCanonicalPath(first);
+            Assert.Equal(first, second);
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Common")]
+        public void GetCanonicalPath_ReturnsSameResult_RegardlessOfInputCasing_OnWindows()
+        {
+            var tempDir = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
+            if (tempDir.StartsWith(@"\\"))
+            {
+                return; // Skip UNC
+            }
+
+            var upper = tempDir.ToUpperInvariant();
+            var lower = tempDir.ToLowerInvariant();
+
+            var resultUpper = PathUtil.GetCanonicalPath(upper);
+            var resultLower = PathUtil.GetCanonicalPath(lower);
+
+            // Both should resolve to the same canonical path
+            Assert.Equal(resultUpper, resultLower);
+        }
 #endif
     }
 }
