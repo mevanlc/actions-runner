@@ -63,15 +63,31 @@ namespace GitHub.Runner.Sdk
 
             var buffer = new StringBuilder(1024);
             var result = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, VOLUME_NAME_DOS);
-            if (result == 0 || result > buffer.Capacity)
+            if (result == 0)
             {
                 return path;
             }
 
+            // Retry with a larger buffer if the path was longer than expected
+            if (result >= buffer.Capacity)
+            {
+                buffer = new StringBuilder((int)result + 1);
+                result = GetFinalPathNameByHandle(handle, buffer, (uint)buffer.Capacity, VOLUME_NAME_DOS);
+                if (result == 0 || result >= buffer.Capacity)
+                {
+                    return path;
+                }
+            }
+
             var canonicalPath = buffer.ToString();
 
-            // Strip the \\?\ prefix that GetFinalPathNameByHandle adds
-            if (canonicalPath.StartsWith(@"\\?\"))
+            // Strip the \\?\UNC\ prefix and convert to standard UNC path
+            if (canonicalPath.StartsWith(@"\\?\UNC\", System.StringComparison.Ordinal))
+            {
+                canonicalPath = @"\\" + canonicalPath.Substring(8);
+            }
+            // Strip the \\?\ prefix for local paths
+            else if (canonicalPath.StartsWith(@"\\?\", System.StringComparison.Ordinal))
             {
                 canonicalPath = canonicalPath.Substring(4);
             }

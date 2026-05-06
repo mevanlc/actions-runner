@@ -61,9 +61,13 @@ namespace GitHub.Runner.Common.Tests.Util
         [Trait("Category", "Common")]
         public void GetCanonicalPath_NormalizesDriveLetter_OnWindows()
         {
-            // The temp directory should always have an uppercase drive letter
-            // when resolved through GetFinalPathNameByHandle
             var tempDir = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
+
+            // Skip if temp is a UNC path (no drive letter to normalize)
+            if (tempDir.StartsWith(@"\\"))
+            {
+                return;
+            }
 
             // Force lowercase drive letter
             var lowerCased = char.ToLower(tempDir[0]) + tempDir.Substring(1);
