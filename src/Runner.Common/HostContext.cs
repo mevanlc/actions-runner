@@ -392,6 +392,7 @@ namespace GitHub.Runner.Common
 
                 case WellKnownDirectory.Root:
                     path = new DirectoryInfo(GetDirectory(WellKnownDirectory.Bin)).Parent.FullName;
+                    path = PathUtil.GetCanonicalPath(path);
                     break;
 
                 case WellKnownDirectory.Temp:
