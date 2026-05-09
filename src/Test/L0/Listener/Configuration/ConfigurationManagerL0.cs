@@ -46,6 +46,7 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
         private int _secondRunnerGroupId = 2;
         private RSACryptoServiceProvider rsa = null;
         private RunnerSettings _configMgrAgentSettings = new();
+        private MultiRunnerSettings _configMgrMultiSettings = new();
 
         public ConfigurationManagerL0()
         {
@@ -93,11 +94,28 @@ namespace GitHub.Runner.Common.Tests.Listener.Configuration
             _store.Setup(x => x.IsConfigured()).Returns(false);
             _store.Setup(x => x.HasCredentials()).Returns(false);
             _store.Setup(x => x.GetSettings()).Returns(() => _configMgrAgentSettings);
+            _store.Setup(x => x.GetMultiSettings()).Returns(() => _configMgrMultiSettings);
 
             _store.Setup(x => x.SaveSettings(It.IsAny<RunnerSettings>()))
                 .Callback((RunnerSettings settings) =>
                 {
                     _configMgrAgentSettings = settings;
+                    _configMgrMultiSettings = new MultiRunnerSettings
+                    {
+                        WorkFolder = settings.WorkFolder,
+                        ExecutionSlots = 1,
+                        Associations = new List<RunnerAssociation>
+                        {
+                            RunnerAssociation.FromRunnerSettings(settings, labels: null, ConfigurationStore.CreateAssociationId(settings.GitHubUrl ?? settings.ServerUrl, settings.AgentName, settings.AgentId)),
+                        },
+                    };
+                });
+
+            _store.Setup(x => x.SaveMultiSettings(It.IsAny<MultiRunnerSettings>()))
+                .Callback((MultiRunnerSettings settings) =>
+                {
+                    _configMgrMultiSettings = settings;
+                    _configMgrAgentSettings = settings.Associations.FirstOrDefault()?.ToRunnerSettings(settings.WorkFolder);
                 });
 
             _credMgr.Setup(x => x.GetCredentialProvider(It.IsAny<string>())).Returns(new TestRunnerCredential());
