@@ -58,6 +58,7 @@ namespace GitHub.Runner.Listener
         private VssCredentials _creds;
         private VssCredentials _credsV2;
         private CredentialData _credentialData;
+        private string _connectionDisplayName;
         private bool _needRefreshCredsV2 = false;
         private bool _handlerInitialized = false;
 
@@ -65,10 +66,11 @@ namespace GitHub.Runner.Listener
         {
         }
 
-        public MessageListener(RunnerSettings settings, CredentialData credentialData)
+        public MessageListener(RunnerSettings settings, CredentialData credentialData, string connectionDisplayName = null)
         {
             _settings = settings;
             _credentialData = credentialData;
+            _connectionDisplayName = connectionDisplayName;
         }
 
         public override void Initialize(IHostContext hostContext)
@@ -123,7 +125,7 @@ namespace GitHub.Runner.Listener
                     Trace.Info("VssConnection created");
 
                     _term.WriteLine();
-                    _term.WriteSuccessMessage("Connected to GitHub");
+                    _term.WriteSuccessMessage(FormatConnectionMessage("Connected to GitHub"));
                     _term.WriteLine();
 
                     _session = await _runnerServer.CreateAgentSessionAsync(
@@ -133,7 +135,7 @@ namespace GitHub.Runner.Listener
                     Trace.Info($"Session created.");
                     if (encounteringError)
                     {
-                        _term.WriteLine($"{DateTime.UtcNow:u}: Runner reconnected.");
+                        _term.WriteLine(FormatConnectionMessage(DateTime.UtcNow, "Runner reconnected."));
                         _sessionCreationExceptionTracker.Clear();
                         encounteringError = false;
                     }
@@ -168,7 +170,7 @@ namespace GitHub.Runner.Listener
                         // "invalid_client" means the runner registration has been deleted from the server.
                         if (string.Equals(vssOAuthEx.Error, "invalid_client", StringComparison.OrdinalIgnoreCase))
                         {
-                            _term.WriteError("Failed to create a session. The runner registration has been deleted from the server, please re-configure. Runner registrations are automatically deleted for runners that have not connected to the service recently.");
+                            _term.WriteError(FormatConnectionMessage("Failed to create a session. The runner registration has been deleted from the server, please re-configure. Runner registrations are automatically deleted for runners that have not connected to the service recently."));
                             return CreateSessionResult.Failure;
                         }
 
@@ -179,14 +181,14 @@ namespace GitHub.Runner.Listener
                         var authError = await oauthTokenProvider.ValidateCredentialAsync(token);
                         if (string.Equals(authError, "invalid_client", StringComparison.OrdinalIgnoreCase))
                         {
-                            _term.WriteError("Failed to create a session. The runner registration has been deleted from the server, please re-configure. Runner registrations are automatically deleted for runners that have not connected to the service recently.");
+                            _term.WriteError(FormatConnectionMessage("Failed to create a session. The runner registration has been deleted from the server, please re-configure. Runner registrations are automatically deleted for runners that have not connected to the service recently."));
                             return CreateSessionResult.Failure;
                         }
                     }
 
                     if (!IsSessionCreationExceptionRetriable(ex))
                     {
-                        _term.WriteError($"Failed to create session. {ex.Message}");
+                        _term.WriteError(FormatConnectionMessage($"Failed to create session. {ex.Message}"));
                         if (ex is TaskAgentSessionConflictException)
                         {
                             return CreateSessionResult.SessionConflict;
@@ -196,7 +198,7 @@ namespace GitHub.Runner.Listener
 
                     if (!encounteringError) //print the message only on the first error
                     {
-                        _term.WriteError($"{DateTime.UtcNow:u}: Runner connect error: {ex.Message}. Retrying until reconnected.");
+                        _term.WriteError(FormatConnectionMessage(DateTime.UtcNow, $"Runner connect error: {ex.Message}. Retrying until reconnected."));
                         encounteringError = true;
                     }
 
@@ -304,7 +306,7 @@ namespace GitHub.Runner.Listener
 
                     if (encounteringError) //print the message once only if there was an error
                     {
-                        _term.WriteLine($"{DateTime.UtcNow:u}: Runner reconnected.");
+                        _term.WriteLine(FormatConnectionMessage(DateTime.UtcNow, "Runner reconnected."));
                         encounteringError = false;
                         continuousError = 0;
                     }
@@ -378,7 +380,7 @@ namespace GitHub.Runner.Listener
                         if (!encounteringError)
                         {
                             //print error only on the first consecutive error
-                            _term.WriteError($"{DateTime.UtcNow:u}: Runner connect error: {ex.Message}. Retrying until reconnected.");
+                            _term.WriteError(FormatConnectionMessage(DateTime.UtcNow, $"Runner connect error: {ex.Message}. Retrying until reconnected."));
                             encounteringError = true;
                         }
 
@@ -457,6 +459,16 @@ namespace GitHub.Runner.Listener
             return _credentialData == null
                 ? _credMgr.LoadCredentials(allowAuthUrlV2)
                 : _credMgr.LoadCredentials(_credentialData, allowAuthUrlV2);
+        }
+
+        private string FormatConnectionMessage(string message)
+        {
+            return string.IsNullOrEmpty(_connectionDisplayName) ? message : $"{_connectionDisplayName}: {message}";
+        }
+
+        private string FormatConnectionMessage(DateTime timestamp, string message)
+        {
+            return string.IsNullOrEmpty(_connectionDisplayName) ? $"{timestamp:u}: {message}" : $"{timestamp:u}: {_connectionDisplayName}: {message}";
         }
 
         public async Task AcknowledgeMessageAsync(string runnerRequestId, CancellationToken cancellationToken)
@@ -541,20 +553,20 @@ namespace GitHub.Runner.Listener
             if (ex is TaskAgentNotFoundException)
             {
                 Trace.Info("The runner no longer exists on the server. Stopping the runner.");
-                _term.WriteError("The runner no longer exists on the server. Please reconfigure the runner.");
+                _term.WriteError(FormatConnectionMessage("The runner no longer exists on the server. Please reconfigure the runner."));
                 return false;
             }
             else if (ex is TaskAgentSessionConflictException)
             {
                 Trace.Info("The session for this runner already exists.");
-                _term.WriteError("A session for this runner already exists.");
+                _term.WriteError(FormatConnectionMessage("A session for this runner already exists."));
                 if (_sessionCreationExceptionTracker.ContainsKey(nameof(TaskAgentSessionConflictException)))
                 {
                     _sessionCreationExceptionTracker[nameof(TaskAgentSessionConflictException)]++;
                     if (_sessionCreationExceptionTracker[nameof(TaskAgentSessionConflictException)] * _sessionCreationRetryInterval.TotalSeconds >= _sessionConflictRetryLimit.TotalSeconds)
                     {
                         Trace.Info("The session conflict exception have reached retry limit.");
-                        _term.WriteError($"Stop retry on SessionConflictException after retried for {_sessionConflictRetryLimit.TotalSeconds} seconds.");
+                        _term.WriteError(FormatConnectionMessage($"Stop retry on SessionConflictException after retried for {_sessionConflictRetryLimit.TotalSeconds} seconds."));
                         return false;
                     }
                 }
@@ -569,14 +581,14 @@ namespace GitHub.Runner.Listener
             else if (ex is VssOAuthTokenRequestException && ex.Message.Contains("Current server time is"))
             {
                 Trace.Info("Local clock might be skewed.");
-                _term.WriteError("The local machine's clock may be out of sync with the server time by more than five minutes. Please sync your clock with your domain or internet time and try again.");
+                _term.WriteError(FormatConnectionMessage("The local machine's clock may be out of sync with the server time by more than five minutes. Please sync your clock with your domain or internet time and try again."));
                 if (_sessionCreationExceptionTracker.ContainsKey(nameof(VssOAuthTokenRequestException)))
                 {
                     _sessionCreationExceptionTracker[nameof(VssOAuthTokenRequestException)]++;
                     if (_sessionCreationExceptionTracker[nameof(VssOAuthTokenRequestException)] * _sessionCreationRetryInterval.TotalSeconds >= _clockSkewRetryLimit.TotalSeconds)
                     {
                         Trace.Info("The OAuth token request exception have reached retry limit.");
-                        _term.WriteError($"Stopped retrying OAuth token request exception after {_clockSkewRetryLimit.TotalSeconds} seconds.");
+                        _term.WriteError(FormatConnectionMessage($"Stopped retrying OAuth token request exception after {_clockSkewRetryLimit.TotalSeconds} seconds."));
                         return false;
                     }
                 }

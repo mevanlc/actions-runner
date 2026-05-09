@@ -407,11 +407,11 @@ namespace GitHub.Runner.Listener
             return HostContext.GetService<IMessageListener>();
         }
 
-        private IMessageListener GetMessageListener(RunnerSettings settings, CredentialData credentialData)
+        private IMessageListener GetMessageListener(RunnerSettings settings, CredentialData credentialData, string connectionDisplayName = null)
         {
             IMessageListener listener = settings.UseV2Flow
-                ? new BrokerMessageListener(settings, credentialData)
-                : new MessageListener(settings, credentialData);
+                ? new BrokerMessageListener(settings, credentialData, connectionDisplayName)
+                : new MessageListener(settings, credentialData, connectionDisplayName);
             listener.Initialize(HostContext);
             return listener;
         }
@@ -946,7 +946,7 @@ namespace GitHub.Runner.Listener
             {
                 var settings = association.ToRunnerSettings(multiSettings.WorkFolder);
                 var credential = store.GetCredential(association.CredentialRef);
-                var listener = GetMessageListener(settings, credential);
+                var listener = GetMessageListener(settings, credential, GetAssociationDisplayName(association));
                 var result = await listener.CreateSessionAsync(HostContext.RunnerShutdownToken);
                 if (result == CreateSessionResult.SessionConflict)
                 {
@@ -972,6 +972,7 @@ namespace GitHub.Runner.Listener
             }
 
             bool runOnceJobReceived = false;
+            Task executionSlotTask = null;
             try
             {
                 var notification = HostContext.GetService<IJobNotification>();
@@ -979,67 +980,66 @@ namespace GitHub.Runner.Listener
 
                 while (!HostContext.RunnerShutdownToken.IsCancellationRequested)
                 {
+                    if (executionSlotTask?.IsCompleted == true)
+                    {
+                        await ObserveExecutionSlotAsync(executionSlotTask);
+                        executionSlotTask = null;
+                        if (runOnceJobReceived)
+                        {
+                            return await GetRunOnceReturnCodeAsync(returnRunOnceJobResult, jobDispatcher);
+                        }
+                    }
+
                     using var pollCts = CancellationTokenSource.CreateLinkedTokenSource(HostContext.RunnerShutdownToken);
                     var polls = listeners.Select(vrn => PollVirtualRunnerAsync(vrn, pollCts.Token)).ToList();
-                    var completed = await Task.WhenAny(polls);
+                    var waitTasks = executionSlotTask == null
+                        ? polls.Cast<Task>().ToList()
+                        : polls.Cast<Task>().Append(executionSlotTask).ToList();
+                    var completed = await Task.WhenAny(waitTasks);
                     pollCts.Cancel();
+
+                    if (completed == executionSlotTask)
+                    {
+                        await ObservePollCancellationAsync(polls, completed);
+                        await ObserveExecutionSlotAsync(executionSlotTask);
+                        executionSlotTask = null;
+                        if (runOnceJobReceived)
+                        {
+                            return await GetRunOnceReturnCodeAsync(returnRunOnceJobResult, jobDispatcher);
+                        }
+
+                        continue;
+                    }
 
                     VirtualRunnerMessage candidate;
                     try
                     {
-                        candidate = await completed;
+                        candidate = await (Task<VirtualRunnerMessage>)completed;
                     }
                     catch (OperationCanceledException) when (HostContext.RunnerShutdownToken.IsCancellationRequested)
                     {
                         break;
                     }
 
-                    foreach (var poll in polls.Where(x => x != completed))
-                    {
-                        try
-                        {
-                            await poll;
-                        }
-                        catch (OperationCanceledException)
-                        {
-                        }
-                        catch (Exception ex)
-                        {
-                            Trace.Info($"Ignoring loser poll exception after cancellation: {ex}");
-                        }
-                    }
+                    await ObservePollCancellationAsync(polls, completed);
 
                     if (candidate?.Message == null)
                     {
                         continue;
                     }
 
-                    bool jobStarted = await ProcessMultiRunnerMessageAsync(candidate, jobDispatcher, runOnce, runOnceJobReceived);
+                    bool executionSlotOccupied = executionSlotTask != null && !executionSlotTask.IsCompleted;
+                    bool jobStarted = await ProcessMultiRunnerMessageAsync(candidate, jobDispatcher, runOnce, runOnceJobReceived, executionSlotOccupied);
                     runOnceJobReceived = runOnceJobReceived || (runOnce && jobStarted);
                     if (runOnceJobReceived)
                     {
-                        var completedTask = await Task.WhenAny(jobDispatcher.RunOnceJobCompleted.Task, Task.Delay(-1, HostContext.RunnerShutdownToken));
-                        if (completedTask == jobDispatcher.RunOnceJobCompleted.Task)
-                        {
-                            if (returnRunOnceJobResult)
-                            {
-                                try
-                                {
-                                    return TaskResultUtil.TranslateToReturnCode(await jobDispatcher.RunOnceJobCompleted.Task);
-                                }
-                                catch (Exception ex)
-                                {
-                                    Trace.Error(ex);
-                                    return Constants.Runner.ReturnCode.TerminatedError;
-                                }
-                            }
-
-                            return Constants.Runner.ReturnCode.Success;
-                        }
+                        executionSlotTask = jobDispatcher.WaitAsync(HostContext.RunnerShutdownToken);
+                        ReportVirtualRunnerStatus(listeners, TaskAgentStatus.Busy);
                     }
-                    else if (jobStarted)
+                    else if (jobStarted && executionSlotTask == null)
                     {
-                        await jobDispatcher.WaitAsync(HostContext.RunnerShutdownToken);
+                        executionSlotTask = jobDispatcher.WaitAsync(HostContext.RunnerShutdownToken);
+                        ReportVirtualRunnerStatus(listeners, TaskAgentStatus.Busy);
                     }
                 }
             }
@@ -1074,10 +1074,85 @@ namespace GitHub.Runner.Listener
             return new VirtualRunnerMessage(vrn, message);
         }
 
-        private async Task<bool> ProcessMultiRunnerMessageAsync(VirtualRunnerMessage candidate, IJobDispatcher jobDispatcher, bool runOnce, bool runOnceJobReceived)
+        private async Task ObservePollCancellationAsync(IEnumerable<Task<VirtualRunnerMessage>> polls, Task completed)
+        {
+            foreach (var poll in polls.Where(x => x != completed))
+            {
+                try
+                {
+                    await poll;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception ex)
+                {
+                    Trace.Info($"Ignoring loser poll exception after cancellation: {ex}");
+                }
+            }
+        }
+
+        private async Task ObserveExecutionSlotAsync(Task executionSlotTask)
+        {
+            try
+            {
+                await executionSlotTask;
+            }
+            catch (OperationCanceledException) when (HostContext.RunnerShutdownToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex)
+            {
+                Trace.Error("Execution slot task failed.");
+                Trace.Error(ex);
+            }
+        }
+
+        private async Task<int> GetRunOnceReturnCodeAsync(bool returnRunOnceJobResult, IJobDispatcher jobDispatcher)
+        {
+            if (returnRunOnceJobResult)
+            {
+                try
+                {
+                    return TaskResultUtil.TranslateToReturnCode(await jobDispatcher.RunOnceJobCompleted.Task);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Error(ex);
+                    return Constants.Runner.ReturnCode.TerminatedError;
+                }
+            }
+
+            return Constants.Runner.ReturnCode.Success;
+        }
+
+        private void ReportVirtualRunnerStatus(IEnumerable<VirtualRunner> listeners, TaskAgentStatus status)
+        {
+            foreach (var vrn in listeners)
+            {
+                vrn.Listener.OnJobStatus(this, new JobStatusEventArgs(status));
+            }
+        }
+
+        private static string GetAssociationDisplayName(RunnerAssociation association)
+        {
+            if (!string.IsNullOrEmpty(association.Url) && Uri.TryCreate(association.Url, UriKind.Absolute, out var uri))
+            {
+                string repoPath = uri.AbsolutePath.Trim('/');
+                if (!string.IsNullOrEmpty(repoPath))
+                {
+                    return repoPath;
+                }
+            }
+
+            return !string.IsNullOrEmpty(association.Url) ? association.Url : association.Id;
+        }
+
+        private async Task<bool> ProcessMultiRunnerMessageAsync(VirtualRunnerMessage candidate, IJobDispatcher jobDispatcher, bool runOnce, bool runOnceJobReceived, bool executionSlotOccupied)
         {
             var vrn = candidate.VirtualRunner;
             var message = candidate.Message;
+            string associationDisplayName = GetAssociationDisplayName(vrn.Association);
             bool skipMessageDeletion = false;
             try
             {
@@ -1086,20 +1161,20 @@ namespace GitHub.Runner.Listener
 
                 if (string.Equals(message.MessageType, JobRequestMessageTypes.PipelineAgentJobRequest, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (jobDispatcher.Busy || runOnceJobReceived)
+                    if (executionSlotOccupied || jobDispatcher.Busy || runOnceJobReceived)
                     {
                         skipMessageDeletion = true;
                         return false;
                     }
 
                     var jobMessage = StringUtil.ConvertFromJson<Pipelines.AgentJobRequestMessage>(message.Body);
-                    jobDispatcher.Run(jobMessage, vrn.Settings, runOnce);
+                    jobDispatcher.Run(jobMessage, vrn.Settings, associationDisplayName, runOnce);
                     return true;
                 }
 
                 if (MessageUtil.IsRunServiceJob(message.MessageType))
                 {
-                    if (jobDispatcher.Busy || runOnceJobReceived)
+                    if (executionSlotOccupied || jobDispatcher.Busy || runOnceJobReceived)
                     {
                         skipMessageDeletion = true;
                         return false;
@@ -1137,7 +1212,7 @@ namespace GitHub.Runner.Listener
                         }
                     }
 
-                    jobDispatcher.Run(jobRequestMessage, vrn.Settings, runOnce);
+                    jobDispatcher.Run(jobRequestMessage, vrn.Settings, associationDisplayName, runOnce);
                     return true;
                 }
 

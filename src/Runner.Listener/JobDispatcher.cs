@@ -27,6 +27,7 @@ namespace GitHub.Runner.Listener
         TaskCompletionSource<TaskResult> RunOnceJobCompleted { get; }
         void Run(Pipelines.AgentJobRequestMessage message, bool runOnce = false);
         void Run(Pipelines.AgentJobRequestMessage message, RunnerSettings runnerSettings, bool runOnce = false);
+        void Run(Pipelines.AgentJobRequestMessage message, RunnerSettings runnerSettings, string jobSource, bool runOnce = false);
         bool Cancel(JobCancelMessage message);
         Task WaitAsync(CancellationToken token);
         Task ShutdownAsync();
@@ -87,12 +88,22 @@ namespace GitHub.Runner.Listener
 
         public bool Busy { get; private set; }
 
+        private static string FormatJobDisplayName(string jobDisplayName, string jobSource)
+        {
+            return string.IsNullOrEmpty(jobSource) ? jobDisplayName : $"{jobSource}: {jobDisplayName}";
+        }
+
         public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage, bool runOnce = false)
         {
-            Run(jobRequestMessage, runnerSettings: null, runOnce);
+            Run(jobRequestMessage, runnerSettings: null, runOnce: runOnce);
         }
 
         public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage, RunnerSettings runnerSettings, bool runOnce = false)
+        {
+            Run(jobRequestMessage, runnerSettings, jobSource: null, runOnce: runOnce);
+        }
+
+        public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage, RunnerSettings runnerSettings, string jobSource, bool runOnce = false)
         {
             Trace.Info($"Job request {jobRequestMessage.RequestId} for plan {jobRequestMessage.Plan.PlanId} job {jobRequestMessage.JobId} received.");
             if (runnerSettings != null)
@@ -137,11 +148,11 @@ namespace GitHub.Runner.Listener
             if (runOnce)
             {
                 Trace.Info("Start dispatcher for one time used runner.");
-                newDispatch.WorkerDispatch = RunOnceAsync(jobRequestMessage, orchestrationId, currentDispatch, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
+                newDispatch.WorkerDispatch = RunOnceAsync(jobRequestMessage, orchestrationId, currentDispatch, jobSource, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
             }
             else
             {
-                newDispatch.WorkerDispatch = RunAsync(jobRequestMessage, orchestrationId, currentDispatch, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
+                newDispatch.WorkerDispatch = RunAsync(jobRequestMessage, orchestrationId, currentDispatch, jobSource, newDispatch.WorkerCancellationTokenSource.Token, newDispatch.WorkerCancelTimeoutKillTokenSource.Token);
             }
 
             _jobInfos.TryAdd(newDispatch.JobId, newDispatch);
@@ -349,12 +360,12 @@ namespace GitHub.Runner.Listener
             }
         }
 
-        private async Task RunOnceAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
+        private async Task RunOnceAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, string jobSource, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
         {
             var jobResult = TaskResult.Succeeded;
             try
             {
-                jobResult = await RunAsync(message, orchestrationId, previousJobDispatch, jobRequestCancellationToken, workerCancelTimeoutKillToken);
+                jobResult = await RunAsync(message, orchestrationId, previousJobDispatch, jobSource, jobRequestCancellationToken, workerCancelTimeoutKillToken);
             }
             finally
             {
@@ -363,7 +374,7 @@ namespace GitHub.Runner.Listener
             }
         }
 
-        private async Task<TaskResult> RunAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
+        private async Task<TaskResult> RunAsync(Pipelines.AgentJobRequestMessage message, string orchestrationId, WorkerDispatcher previousJobDispatch, string jobSource, CancellationToken jobRequestCancellationToken, CancellationToken workerCancelTimeoutKillToken)
         {
             Busy = true;
             try
@@ -384,7 +395,8 @@ namespace GitHub.Runner.Listener
                 }
 
                 var term = HostContext.GetService<ITerminal>();
-                term.WriteLine($"{DateTime.UtcNow:u}: Running job: {message.JobDisplayName}");
+                string jobDisplayName = FormatJobDisplayName(message.JobDisplayName, jobSource);
+                term.WriteLine($"{DateTime.UtcNow:u}: Running job: {jobDisplayName}");
 
                 // first job request renew succeed.
                 TaskCompletionSource<int> firstJobRequestRenewed = new();
@@ -597,7 +609,7 @@ namespace GitHub.Runner.Listener
 
                                 TaskResult result = TaskResultUtil.TranslateFromReturnCode(returnCode);
                                 Trace.Info($"finish job request for job {message.JobId} with result: {result}");
-                                term.WriteLine($"{DateTime.UtcNow:u}: Job {message.JobDisplayName} completed with result: {result}");
+                                term.WriteLine($"{DateTime.UtcNow:u}: Job {jobDisplayName} completed with result: {result}");
 
                                 Trace.Info($"Stop renew job request for job {message.JobId}.");
                                 // stop renew lock
@@ -707,7 +719,7 @@ namespace GitHub.Runner.Listener
                             }
 
                             Trace.Info($"finish job request for job {message.JobId} with result: {resultOnAbandonOrCancel}");
-                            term.WriteLine($"{DateTime.UtcNow:u}: Job {message.JobDisplayName} completed with result: {resultOnAbandonOrCancel}");
+                            term.WriteLine($"{DateTime.UtcNow:u}: Job {jobDisplayName} completed with result: {resultOnAbandonOrCancel}");
                             // complete job request with cancel result, stop renew lock, job has finished.
 
                             Trace.Info($"Stop renew job request for job {message.JobId}.");
