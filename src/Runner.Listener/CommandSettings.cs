@@ -40,6 +40,7 @@ namespace GitHub.Runner.Listener
                     Constants.Runner.CommandLine.Flags.Unattended,
                     Constants.Runner.CommandLine.Flags.NoDefaultLabels,
                     Constants.Runner.CommandLine.Args.Auth,
+                    Constants.Runner.CommandLine.Args.Id,
                     Constants.Runner.CommandLine.Args.Labels,
                     Constants.Runner.CommandLine.Args.MonitorSocketAddress,
                     Constants.Runner.CommandLine.Args.Name,
@@ -78,6 +79,9 @@ namespace GitHub.Runner.Listener
         public bool Remove => TestCommand(Constants.Runner.CommandLine.Commands.Remove);
         public bool Run => TestCommand(Constants.Runner.CommandLine.Commands.Run);
         public bool Warmup => TestCommand(Constants.Runner.CommandLine.Commands.Warmup);
+        public bool AddRepo => Configure && TestSubCommand(Constants.Runner.CommandLine.Commands.AddRepo);
+        public bool RemoveRepo => Configure && TestSubCommand(Constants.Runner.CommandLine.Commands.RemoveRepo);
+        public bool ListRepos => Configure && TestSubCommand(Constants.Runner.CommandLine.Commands.ListRepos);
 
         // Flags.
         public bool Check => TestFlag(Constants.Runner.CommandLine.Flags.Check);
@@ -146,7 +150,9 @@ namespace GitHub.Runner.Listener
             List<string> unknowns = new();
 
             // detect unknown commands
-            unknowns.AddRange(_parser.Commands.Where(x => !validOptions.Keys.Contains(x, StringComparer.OrdinalIgnoreCase)));
+            unknowns.AddRange(_parser.Commands.Where((x, index) =>
+                !validOptions.Keys.Contains(x, StringComparer.OrdinalIgnoreCase) &&
+                !(index == 1 && IsConfigureSubCommand(x))));
 
             if (unknowns.Count == 0)
             {
@@ -232,6 +238,21 @@ namespace GitHub.Runner.Listener
                 description: "Enter the name of runner:",
                 defaultValue: Environment.MachineName ?? "myrunner",
                 validator: Validators.NonEmptyValidator);
+        }
+
+        public string GetRunnerName(bool suppressPromptIfEmpty)
+        {
+            if (suppressPromptIfEmpty)
+            {
+                return GetArg(Constants.Runner.CommandLine.Args.Name);
+            }
+
+            return GetRunnerName();
+        }
+
+        public string GetRepoId()
+        {
+            return GetArg(Constants.Runner.CommandLine.Args.Id);
         }
 
         public string GetRunnerGroupName(string defaultPoolName = null)
@@ -443,6 +464,21 @@ namespace GitHub.Runner.Listener
             bool result = _parser.IsCommand(name);
             _trace.Info($"Command '{name}': '{result}'");
             return result;
+        }
+
+        private bool TestSubCommand(string name)
+        {
+            bool result = _parser.Commands.Count > 1 &&
+                          string.Equals(name, _parser.Commands[1], StringComparison.CurrentCultureIgnoreCase);
+            _trace.Info($"Sub-command '{name}': '{result}'");
+            return result;
+        }
+
+        private bool IsConfigureSubCommand(string command)
+        {
+            return string.Equals(command, Constants.Runner.CommandLine.Commands.AddRepo, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(command, Constants.Runner.CommandLine.Commands.RemoveRepo, StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(command, Constants.Runner.CommandLine.Commands.ListRepos, StringComparison.OrdinalIgnoreCase);
         }
 
         private bool TestFlag(string name)

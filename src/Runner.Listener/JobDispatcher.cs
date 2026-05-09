@@ -26,6 +26,7 @@ namespace GitHub.Runner.Listener
         bool Busy { get; }
         TaskCompletionSource<TaskResult> RunOnceJobCompleted { get; }
         void Run(Pipelines.AgentJobRequestMessage message, bool runOnce = false);
+        void Run(Pipelines.AgentJobRequestMessage message, RunnerSettings runnerSettings, bool runOnce = false);
         bool Cancel(JobCancelMessage message);
         Task WaitAsync(CancellationToken token);
         Task ShutdownAsync();
@@ -88,7 +89,17 @@ namespace GitHub.Runner.Listener
 
         public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage, bool runOnce = false)
         {
+            Run(jobRequestMessage, runnerSettings: null, runOnce);
+        }
+
+        public void Run(Pipelines.AgentJobRequestMessage jobRequestMessage, RunnerSettings runnerSettings, bool runOnce = false)
+        {
             Trace.Info($"Job request {jobRequestMessage.RequestId} for plan {jobRequestMessage.Plan.PlanId} job {jobRequestMessage.JobId} received.");
+            if (runnerSettings != null)
+            {
+                _runnerSettings = runnerSettings;
+                _poolId = runnerSettings.PoolId;
+            }
 
             _isRunServiceJob = MessageUtil.IsRunServiceJob(jobRequestMessage.MessageType);
 

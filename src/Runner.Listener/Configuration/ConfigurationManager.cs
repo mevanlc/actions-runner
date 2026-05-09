@@ -26,6 +26,7 @@ namespace GitHub.Runner.Listener.Configuration
         void DeleteLocalRunnerConfig();
         RunnerSettings LoadSettings();
         RunnerSettings LoadMigratedSettings();
+        MultiRunnerSettings LoadMultiSettings();
     }
 
     public sealed class ConfigurationManager : RunnerService, IConfigurationManager
@@ -67,6 +68,20 @@ namespace GitHub.Runner.Listener.Configuration
             return settings;
         }
 
+        public MultiRunnerSettings LoadMultiSettings()
+        {
+            Trace.Info(nameof(LoadMultiSettings));
+            if (!IsConfigured())
+            {
+                throw new NonRetryableException("Not configured. Run config.(sh/cmd) add-repo to configure the runner.");
+            }
+
+            MultiRunnerSettings settings = _store.GetMultiSettings();
+            Trace.Info("Multi-runner settings loaded");
+
+            return settings;
+        }
+
         public RunnerSettings LoadMigratedSettings()
         {
             Trace.Info(nameof(LoadMigratedSettings));
@@ -85,6 +100,24 @@ namespace GitHub.Runner.Listener.Configuration
 
         public async Task ConfigureAsync(CommandSettings command)
         {
+            if (command.ListRepos)
+            {
+                ListRepos();
+                return;
+            }
+
+            if (command.RemoveRepo)
+            {
+                RemoveRepo(command);
+                return;
+            }
+
+            bool addRepo = command.AddRepo || (!command.ListRepos && !command.RemoveRepo && !command.GenerateServiceConfig);
+            if (!addRepo && !command.GenerateServiceConfig)
+            {
+                throw new InvalidOperationException("This fork only supports multi-repo configuration. Use './config.sh add-repo --url <url> --token <token>', './config.sh list-repos', or './config.sh remove-repo'.");
+            }
+
             _term.WriteLine();
             _term.WriteLine("--------------------------------------------------------------------------------");
             _term.WriteLine("|        ____ _ _   _   _       _          _        _   _                      |");
@@ -119,11 +152,6 @@ namespace GitHub.Runner.Listener.Configuration
 #else
                 throw new NotSupportedException("--generateServiceConfig is only supported on Linux.");
 #endif
-            }
-
-            if (IsConfigured())
-            {
-                throw new InvalidOperationException("Cannot configure the runner because it is already configured. To reconfigure the runner, run 'config.cmd remove' or './config.sh remove' first.");
             }
 
             RunnerSettings runnerSettings = new();
@@ -252,15 +280,17 @@ namespace GitHub.Runner.Listener.Configuration
             }
 
             TaskAgent agent;
+            ISet<string> userLabels = null;
             while (true)
             {
                 runnerSettings.DisableUpdate = command.DisableUpdate;
                 runnerSettings.Ephemeral = command.Ephemeral;
                 runnerSettings.AgentName = command.GetRunnerName();
+                EnsureAssociationDoesNotExist(runnerSettings.GitHubUrl, runnerSettings.AgentName);
 
                 _term.WriteLine();
 
-                var userLabels = command.GetLabels();
+                userLabels = command.GetLabels();
                 _term.WriteLine();
                 List<TaskAgent> agents;
                 if (runnerSettings.UseRunnerAdminFlow)
@@ -392,11 +422,12 @@ namespace GitHub.Runner.Listener.Configuration
             runnerSettings.AgentId = agent.Id;
 
             // See if the server supports our OAuth key exchange for credentials
+            CredentialData credentialData = null;
             if (agent.Authorization != null &&
                 agent.Authorization.ClientId != Guid.Empty &&
                 agent.Authorization.AuthorizationUrl != null)
             {
-                var credentialData = new CredentialData
+                credentialData = new CredentialData
                 {
                     Scheme = Constants.Configuration.OAuth,
                     Data =
@@ -414,9 +445,6 @@ namespace GitHub.Runner.Listener.Configuration
                     credentialData.Data["enableAuthMigrationByDefault"] = "true";
                     credentialData.Data["authorizationUrlV2"] = authUrlV2;
                 }
-
-                // Save the negotiated OAuth credential data
-                _store.SaveCredential(credentialData);
             }
             else
             {
@@ -442,7 +470,7 @@ namespace GitHub.Runner.Listener.Configuration
             if (!runnerSettings.UseV2Flow && !runnerSettings.UseRunnerAdminFlow)
             {
                 var credMgr = HostContext.GetService<ICredentialManager>();
-                VssCredentials credential = credMgr.LoadCredentials(allowAuthUrlV2: false);
+                VssCredentials credential = credMgr.LoadCredentials(credentialData, allowAuthUrlV2: false);
                 try
                 {
                     await _runnerServer.ConnectAsync(new Uri(runnerSettings.ServerUrl), credential);
@@ -469,7 +497,7 @@ namespace GitHub.Runner.Listener.Configuration
 
             runnerSettings.MonitorSocketAddress = command.GetMonitorSocketAddress();
 
-            _store.SaveSettings(runnerSettings);
+            PersistAssociation(command, runnerSettings, userLabels, credentialData);
 
             _term.WriteLine();
             _term.WriteSuccessMessage("Settings Saved.");
@@ -615,6 +643,123 @@ namespace GitHub.Runner.Listener.Configuration
             }
 
             _term.WriteLine();
+        }
+
+        private void ListRepos()
+        {
+            _term.WriteSection("Configured repositories");
+            if (!_store.IsConfigured())
+            {
+                _term.WriteLine("No repositories configured.");
+                return;
+            }
+
+            var settings = _store.GetMultiSettings();
+            if (settings.Associations.Count == 0)
+            {
+                _term.WriteLine("No repositories configured.");
+                return;
+            }
+
+            foreach (var association in settings.Associations.OrderBy(x => x.Url).ThenBy(x => x.AgentName))
+            {
+                _term.WriteLine($"{association.Id}  {association.AgentName}  {association.Url}");
+            }
+        }
+
+        private void RemoveRepo(CommandSettings command)
+        {
+            _term.WriteSection("Repository removal");
+            if (!_store.IsConfigured())
+            {
+                _term.WriteLine("No repositories configured.");
+                return;
+            }
+
+            string id = command.GetRepoId();
+            string url = command.GetUrl(suppressPromptIfEmpty: true);
+            string name = command.GetRunnerName(suppressPromptIfEmpty: true);
+            var settings = _store.GetMultiSettings();
+
+            var matches = settings.Associations.Where(x =>
+                (!string.IsNullOrEmpty(id) && string.Equals(x.Id, id, StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrEmpty(url) && string.Equals(x.Url, url, StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrEmpty(name) && string.Equals(x.AgentName, name, StringComparison.OrdinalIgnoreCase))).ToList();
+
+            if (matches.Count == 0)
+            {
+                throw new InvalidOperationException("No matching repository association found.");
+            }
+
+            if (matches.Count > 1)
+            {
+                throw new InvalidOperationException("Multiple repository associations matched. Use --id to remove exactly one association.");
+            }
+
+            var association = matches[0];
+            settings.Associations.Remove(association);
+            _store.DeleteCredential(association.CredentialRef);
+            if (settings.Associations.Count == 0)
+            {
+                _store.DeleteSettings();
+            }
+            else
+            {
+                _store.SaveMultiSettings(settings);
+            }
+
+            _term.WriteSuccessMessage($"Removed repository association {association.Id}");
+        }
+
+        private void PersistAssociation(CommandSettings command, RunnerSettings runnerSettings, ISet<string> userLabels, CredentialData credentialData)
+        {
+            string id = RunnerAssociationId(runnerSettings);
+            MultiRunnerSettings settings;
+            if (_store.IsConfigured())
+            {
+                settings = _store.GetMultiSettings();
+            }
+            else
+            {
+                settings = new MultiRunnerSettings
+                {
+                    WorkFolder = runnerSettings.WorkFolder,
+                    ExecutionSlots = 1,
+                };
+            }
+
+            settings.WorkFolder = runnerSettings.WorkFolder;
+            if (settings.Associations.Any(x => string.Equals(x.Id, id, StringComparison.OrdinalIgnoreCase) ||
+                                               string.Equals(x.Url, runnerSettings.GitHubUrl, StringComparison.OrdinalIgnoreCase) &&
+                                               string.Equals(x.AgentName, runnerSettings.AgentName, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new InvalidOperationException($"Repository association for '{runnerSettings.GitHubUrl}' and runner '{runnerSettings.AgentName}' already exists.");
+            }
+
+            var association = RunnerAssociation.FromRunnerSettings(runnerSettings, userLabels, id);
+            settings.Associations.Add(association);
+            _store.SaveCredential(id, credentialData);
+            _store.SaveMultiSettings(settings);
+        }
+
+        private void EnsureAssociationDoesNotExist(string url, string agentName)
+        {
+            if (!_store.IsConfigured())
+            {
+                return;
+            }
+
+            var settings = _store.GetMultiSettings();
+            if (settings.Associations.Any(x => string.Equals(x.Url, url, StringComparison.OrdinalIgnoreCase) &&
+                                               string.Equals(x.AgentName, agentName, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new InvalidOperationException($"Repository association for '{url}' and runner '{agentName}' already exists.");
+            }
+        }
+
+        private static string RunnerAssociationId(RunnerSettings runnerSettings)
+        {
+            return ConfigurationStore.CreateAssociationId(runnerSettings.GitHubUrl ?? runnerSettings.ServerUrl, runnerSettings.AgentName, runnerSettings.AgentId);
         }
 
         private ICredentialProvider GetCredentialProvider(CommandSettings command, string serverUrl)

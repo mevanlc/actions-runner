@@ -95,6 +95,7 @@ namespace GitHub.Runner.Common
                 public static class Args
                 {
                     public static readonly string Auth = "auth";
+                    public static readonly string Id = "id";
                     public static readonly string Labels = "labels";
                     public static readonly string MonitorSocketAddress = "monitorsocketaddress";
                     public static readonly string Name = "name";
@@ -121,8 +122,11 @@ namespace GitHub.Runner.Common
 
                 public static class Commands
                 {
+                    public static readonly string AddRepo = "add-repo";
                     public static readonly string Configure = "configure";
+                    public static readonly string ListRepos = "list-repos";
                     public static readonly string Remove = "remove";
+                    public static readonly string RemoveRepo = "remove-repo";
                     public static readonly string Run = "run";
                     public static readonly string Warmup = "warmup";
                 }

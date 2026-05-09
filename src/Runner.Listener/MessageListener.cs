@@ -57,16 +57,27 @@ namespace GitHub.Runner.Listener
         private CancellationTokenSource _getMessagesTokenSource;
         private VssCredentials _creds;
         private VssCredentials _credsV2;
+        private CredentialData _credentialData;
         private bool _needRefreshCredsV2 = false;
         private bool _handlerInitialized = false;
+
+        public MessageListener()
+        {
+        }
+
+        public MessageListener(RunnerSettings settings, CredentialData credentialData)
+        {
+            _settings = settings;
+            _credentialData = credentialData;
+        }
 
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
 
             _term = HostContext.GetService<ITerminal>();
-            _runnerServer = HostContext.GetService<IRunnerServer>();
-            _brokerServer = hostContext.GetService<IBrokerServer>();
+            _runnerServer = _credentialData == null ? HostContext.GetService<IRunnerServer>() : HostContext.CreateService<IRunnerServer>();
+            _brokerServer = _credentialData == null ? hostContext.GetService<IBrokerServer>() : HostContext.CreateService<IBrokerServer>();
             _credMgr = hostContext.GetService<ICredentialManager>();
         }
 
@@ -75,14 +86,17 @@ namespace GitHub.Runner.Listener
             Trace.Entering();
 
             // Settings
-            var configManager = HostContext.GetService<IConfigurationManager>();
-            _settings = configManager.LoadSettings();
+            if (_settings == null)
+            {
+                var configManager = HostContext.GetService<IConfigurationManager>();
+                _settings = configManager.LoadSettings();
+            }
             var serverUrl = _settings.ServerUrl;
             Trace.Info(_settings);
 
             // Create connection.
             Trace.Info("Loading Credentials");
-            _creds = _credMgr.LoadCredentials(allowAuthUrlV2: false);
+            _creds = LoadCredentials(allowAuthUrlV2: false);
 
             var agent = new TaskAgentReference
             {
@@ -265,7 +279,7 @@ namespace GitHub.Runner.Listener
                     {
                         var migrationMessage = JsonUtility.FromString<BrokerMigrationMessage>(message.Body);
 
-                        _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+                        _credsV2 = LoadCredentials(allowAuthUrlV2: true);
                         await _brokerServer.UpdateConnectionIfNeeded(migrationMessage.BrokerBaseUrl, _credsV2);
                         if (_needRefreshCredsV2)
                         {
@@ -434,8 +448,15 @@ namespace GitHub.Runner.Listener
         public async Task RefreshListenerTokenAsync()
         {
             await _runnerServer.RefreshConnectionAsync(RunnerConnectionType.MessageQueue, TimeSpan.FromSeconds(60));
-            _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+            _credsV2 = LoadCredentials(allowAuthUrlV2: true);
             await _brokerServer.ForceRefreshConnection(_credsV2);
+        }
+
+        private VssCredentials LoadCredentials(bool allowAuthUrlV2)
+        {
+            return _credentialData == null
+                ? _credMgr.LoadCredentials(allowAuthUrlV2)
+                : _credMgr.LoadCredentials(_credentialData, allowAuthUrlV2);
         }
 
         public async Task AcknowledgeMessageAsync(string runnerRequestId, CancellationToken cancellationToken)

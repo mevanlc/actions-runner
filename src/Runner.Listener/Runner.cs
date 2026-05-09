@@ -167,23 +167,9 @@ namespace GitHub.Runner.Listener
                 // remove config files, remove service, and exit
                 if (command.Remove)
                 {
-                    // only remove local config files and exit
-                    if (command.RemoveLocalConfig)
-                    {
-                        configManager.DeleteLocalRunnerConfig();
-                        return Constants.Runner.ReturnCode.Success;
-                    }
-                    try
-                    {
-                        await configManager.UnconfigureAsync(command);
-                        return Constants.Runner.ReturnCode.Success;
-                    }
-                    catch (Exception ex)
-                    {
-                        Trace.Error(ex);
-                        _term.WriteError(ex.Message);
-                        return Constants.Runner.ReturnCode.TerminatedError;
-                    }
+                    // Multi-repo runner removal is always local-only. Remote bulk unregistering is intentionally out of scope.
+                    configManager.DeleteLocalRunnerConfig();
+                    return Constants.Runner.ReturnCode.Success;
                 }
 
                 _inConfigStage = false;
@@ -267,7 +253,19 @@ namespace GitHub.Runner.Listener
                     }
                 }
 
-                RunnerSettings settings = configManager.LoadSettings();
+                MultiRunnerSettings multiSettings = null;
+                RunnerSettings settings = null;
+                try
+                {
+                    multiSettings = configManager.LoadMultiSettings();
+                    settings = multiSettings?.Associations?.FirstOrDefault()?.ToRunnerSettings(multiSettings.WorkFolder);
+                }
+                catch (Exception ex)
+                {
+                    Trace.Info($"Unable to load multi-runner settings: {ex.Message}");
+                }
+
+                settings ??= configManager.LoadSettings();
 
                 var store = HostContext.GetService<IConfigurationStore>();
                 bool configuredAsService = store.IsServiceConfigured();
@@ -328,6 +326,12 @@ namespace GitHub.Runner.Listener
                     var returnJobResultForHosted = StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED"));
 
                     // Run the runner interactively or as service
+                    if (multiSettings?.Associations?.Count > 0)
+                    {
+                        bool anyEphemeral = multiSettings.Associations.Any(x => x.Ephemeral);
+                        return await ExecuteMultiRunnerAsync(multiSettings, command.RunOnce || anyEphemeral || returnJobResultForHosted, returnJobResultForHosted);
+                    }
+
                     return await ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral || returnJobResultForHosted, returnJobResultForHosted);
                 }
                 else
@@ -401,6 +405,15 @@ namespace GitHub.Runner.Listener
             }
 
             return HostContext.GetService<IMessageListener>();
+        }
+
+        private IMessageListener GetMessageListener(RunnerSettings settings, CredentialData credentialData)
+        {
+            IMessageListener listener = settings.UseV2Flow
+                ? new BrokerMessageListener(settings, credentialData)
+                : new MessageListener(settings, credentialData);
+            listener.Initialize(HostContext);
+            return listener;
         }
 
         //create worker manager, create message listener and start listening to the queue
@@ -906,6 +919,289 @@ namespace GitHub.Runner.Listener
             return returnCode;
         }
 
+        private async Task<int> ExecuteMultiRunnerAsync(MultiRunnerSettings multiSettings, bool runOnce, bool returnRunOnceJobResult)
+        {
+            if (multiSettings?.Associations == null || multiSettings.Associations.Count == 0)
+            {
+                _term.WriteError("Runner is not configured. Add at least one repository with './config.sh add-repo'.");
+                return Constants.Runner.ReturnCode.TerminatedError;
+            }
+
+            string workDirectory = HostContext.GetDirectory(WellKnownDirectory.Work);
+            try
+            {
+                Directory.CreateDirectory(workDirectory);
+                IOUtil.ValidateExecutePermission(workDirectory);
+            }
+            catch (Exception ex)
+            {
+                Trace.Error(ex);
+                _term.WriteError($"Fail to create and validate runner's work directory '{workDirectory}'.");
+                return Constants.Runner.ReturnCode.TerminatedError;
+            }
+
+            var store = HostContext.GetService<IConfigurationStore>();
+            var listeners = new List<VirtualRunner>();
+            foreach (var association in multiSettings.Associations)
+            {
+                var settings = association.ToRunnerSettings(multiSettings.WorkFolder);
+                var credential = store.GetCredential(association.CredentialRef);
+                var listener = GetMessageListener(settings, credential);
+                var result = await listener.CreateSessionAsync(HostContext.RunnerShutdownToken);
+                if (result == CreateSessionResult.SessionConflict)
+                {
+                    return Constants.Runner.ReturnCode.SessionConflict;
+                }
+
+                if (result == CreateSessionResult.Failure)
+                {
+                    return Constants.Runner.ReturnCode.TerminatedError;
+                }
+
+                listeners.Add(new VirtualRunner(association, settings, credential, listener));
+            }
+
+            HostContext.WritePerfCounter("MultiRepoSessionsCreated");
+            _term.WriteLine($"Current runner version: '{BuildConstants.RunnerPackage.Version}'");
+            _term.WriteLine($"{DateTime.UtcNow:u}: Listening for Jobs across {listeners.Count} repositories");
+
+            IJobDispatcher jobDispatcher = HostContext.CreateService<IJobDispatcher>();
+            foreach (var vrn in listeners)
+            {
+                jobDispatcher.JobStatus += vrn.Listener.OnJobStatus;
+            }
+
+            bool runOnceJobReceived = false;
+            try
+            {
+                var notification = HostContext.GetService<IJobNotification>();
+                notification.StartClient(multiSettings.Associations.FirstOrDefault()?.MonitorSocketAddress);
+
+                while (!HostContext.RunnerShutdownToken.IsCancellationRequested)
+                {
+                    using var pollCts = CancellationTokenSource.CreateLinkedTokenSource(HostContext.RunnerShutdownToken);
+                    var polls = listeners.Select(vrn => PollVirtualRunnerAsync(vrn, pollCts.Token)).ToList();
+                    var completed = await Task.WhenAny(polls);
+                    pollCts.Cancel();
+
+                    VirtualRunnerMessage candidate;
+                    try
+                    {
+                        candidate = await completed;
+                    }
+                    catch (OperationCanceledException) when (HostContext.RunnerShutdownToken.IsCancellationRequested)
+                    {
+                        break;
+                    }
+
+                    foreach (var poll in polls.Where(x => x != completed))
+                    {
+                        try
+                        {
+                            await poll;
+                        }
+                        catch (OperationCanceledException)
+                        {
+                        }
+                        catch (Exception ex)
+                        {
+                            Trace.Info($"Ignoring loser poll exception after cancellation: {ex}");
+                        }
+                    }
+
+                    if (candidate?.Message == null)
+                    {
+                        continue;
+                    }
+
+                    bool jobStarted = await ProcessMultiRunnerMessageAsync(candidate, jobDispatcher, runOnce, runOnceJobReceived);
+                    runOnceJobReceived = runOnceJobReceived || (runOnce && jobStarted);
+                    if (runOnceJobReceived)
+                    {
+                        var completedTask = await Task.WhenAny(jobDispatcher.RunOnceJobCompleted.Task, Task.Delay(-1, HostContext.RunnerShutdownToken));
+                        if (completedTask == jobDispatcher.RunOnceJobCompleted.Task)
+                        {
+                            if (returnRunOnceJobResult)
+                            {
+                                try
+                                {
+                                    return TaskResultUtil.TranslateToReturnCode(await jobDispatcher.RunOnceJobCompleted.Task);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Trace.Error(ex);
+                                    return Constants.Runner.ReturnCode.TerminatedError;
+                                }
+                            }
+
+                            return Constants.Runner.ReturnCode.Success;
+                        }
+                    }
+                    else if (jobStarted)
+                    {
+                        await jobDispatcher.WaitAsync(HostContext.RunnerShutdownToken);
+                    }
+                }
+            }
+            finally
+            {
+                foreach (var vrn in listeners)
+                {
+                    jobDispatcher.JobStatus -= vrn.Listener.OnJobStatus;
+                }
+
+                await jobDispatcher.ShutdownAsync();
+                foreach (var vrn in listeners)
+                {
+                    try
+                    {
+                        await vrn.Listener.DeleteSessionAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error($"Failed to delete session for association '{vrn.Association.Id}'.");
+                        Trace.Error(ex);
+                    }
+                }
+            }
+
+            return Constants.Runner.ReturnCode.Success;
+        }
+
+        private async Task<VirtualRunnerMessage> PollVirtualRunnerAsync(VirtualRunner vrn, CancellationToken token)
+        {
+            var message = await vrn.Listener.GetNextMessageAsync(token);
+            return new VirtualRunnerMessage(vrn, message);
+        }
+
+        private async Task<bool> ProcessMultiRunnerMessageAsync(VirtualRunnerMessage candidate, IJobDispatcher jobDispatcher, bool runOnce, bool runOnceJobReceived)
+        {
+            var vrn = candidate.VirtualRunner;
+            var message = candidate.Message;
+            bool skipMessageDeletion = false;
+            try
+            {
+                HostContext.WritePerfCounter($"MessageReceived_{message.MessageType}");
+                Trace.Info($"Association '{vrn.Association.Id}' received message '{message.MessageId}' of type '{message.MessageType}'.");
+
+                if (string.Equals(message.MessageType, JobRequestMessageTypes.PipelineAgentJobRequest, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (jobDispatcher.Busy || runOnceJobReceived)
+                    {
+                        skipMessageDeletion = true;
+                        return false;
+                    }
+
+                    var jobMessage = StringUtil.ConvertFromJson<Pipelines.AgentJobRequestMessage>(message.Body);
+                    jobDispatcher.Run(jobMessage, vrn.Settings, runOnce);
+                    return true;
+                }
+
+                if (MessageUtil.IsRunServiceJob(message.MessageType))
+                {
+                    if (jobDispatcher.Busy || runOnceJobReceived)
+                    {
+                        skipMessageDeletion = true;
+                        return false;
+                    }
+
+                    var messageRef = StringUtil.ConvertFromJson<RunnerJobRequestRef>(message.Body);
+                    Pipelines.AgentJobRequestMessage jobRequestMessage = null;
+                    var credMgr = HostContext.GetService<ICredentialManager>();
+
+                    if (string.IsNullOrEmpty(messageRef.RunServiceUrl))
+                    {
+                        var creds = credMgr.LoadCredentials(vrn.CredentialData, allowAuthUrlV2: false);
+                        var actionsRunServer = HostContext.CreateService<IActionsRunServer>();
+                        await actionsRunServer.ConnectAsync(new Uri(vrn.Settings.ServerUrl), creds);
+                        jobRequestMessage = await actionsRunServer.GetJobMessageAsync(messageRef.RunnerRequestId, HostContext.RunnerShutdownToken);
+                    }
+                    else
+                    {
+                        var credsV2 = credMgr.LoadCredentials(vrn.CredentialData, allowAuthUrlV2: true);
+                        var runServer = HostContext.CreateService<IRunServer>();
+                        await runServer.ConnectAsync(new Uri(messageRef.RunServiceUrl), credsV2);
+                        jobRequestMessage = await runServer.GetJobMessageAsync(messageRef.RunnerRequestId, messageRef.BillingOwnerId, HostContext.RunnerShutdownToken);
+                    }
+
+                    if (messageRef.ShouldAcknowledge)
+                    {
+                        try
+                        {
+                            await vrn.Listener.AcknowledgeMessageAsync(messageRef.RunnerRequestId, HostContext.RunnerShutdownToken);
+                        }
+                        catch (Exception ex)
+                        {
+                            Trace.Error($"Best-effort acknowledge failed for request '{messageRef.RunnerRequestId}'.");
+                            Trace.Error(ex);
+                        }
+                    }
+
+                    jobDispatcher.Run(jobRequestMessage, vrn.Settings, runOnce);
+                    return true;
+                }
+
+                if (string.Equals(message.MessageType, JobCancelMessage.MessageType, StringComparison.OrdinalIgnoreCase))
+                {
+                    var cancelJobMessage = JsonUtility.FromString<JobCancelMessage>(message.Body);
+                    jobDispatcher.Cancel(cancelJobMessage);
+                    return false;
+                }
+
+                if (string.Equals(message.MessageType, TaskAgentMessageTypes.ForceTokenRefresh))
+                {
+                    await vrn.Listener.RefreshListenerTokenAsync();
+                    return false;
+                }
+
+                Trace.Info($"Ignoring unsupported multi-repo message type '{message.MessageType}' for association '{vrn.Association.Id}'.");
+                return false;
+            }
+            finally
+            {
+                if (!skipMessageDeletion)
+                {
+                    try
+                    {
+                        await vrn.Listener.DeleteMessageAsync(message);
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Error($"Failed to delete message '{message.MessageId}' for association '{vrn.Association.Id}'.");
+                        Trace.Error(ex);
+                    }
+                }
+            }
+        }
+
+        private sealed class VirtualRunner
+        {
+            public VirtualRunner(RunnerAssociation association, RunnerSettings settings, CredentialData credentialData, IMessageListener listener)
+            {
+                Association = association;
+                Settings = settings;
+                CredentialData = credentialData;
+                Listener = listener;
+            }
+
+            public RunnerAssociation Association { get; }
+            public RunnerSettings Settings { get; }
+            public CredentialData CredentialData { get; }
+            public IMessageListener Listener { get; }
+        }
+
+        private sealed class VirtualRunnerMessage
+        {
+            public VirtualRunnerMessage(VirtualRunner virtualRunner, TaskAgentMessage message)
+            {
+                VirtualRunner = virtualRunner;
+                Message = message;
+            }
+
+            public VirtualRunner VirtualRunner { get; }
+            public TaskAgentMessage Message { get; }
+        }
+
         private void HandleAuthMigrationChanged(object sender, AuthMigrationEventArgs e)
         {
             Trace.Verbose("Handle AuthMigrationChanged in Runner");
@@ -1111,8 +1407,10 @@ namespace GitHub.Runner.Listener
 #endif
             _term.WriteLine($@"
 Commands:
- .{separator}config.{ext}         Configures the runner
- .{separator}config.{ext} remove  Unconfigures the runner
+ .{separator}config.{ext} add-repo     Adds a repository association
+ .{separator}config.{ext} remove-repo  Removes one local repository association
+ .{separator}config.{ext} list-repos   Lists configured repository associations
+ .{separator}config.{ext} remove       Removes all local runner configuration
  .{separator}run.{ext}            Runs the runner interactively. Does not require any options.
 
 Options:
@@ -1121,20 +1419,21 @@ Options:
  --commit   Prints the runner commit
  --check    Check the runner's network connectivity with GitHub server
 
-Config Options:
+ Config Options:
  --unattended           Disable interactive prompts for missing arguments. Defaults will be used for missing options
- --url string           Repository to add the runner to. Required if unattended
- --token string         Registration token. Required if unattended
+	 --url string           Repository to add the runner to. Required if unattended
+	 --id string            Local repository association id. Used with remove-repo
+	 --token string         Registration token. Required if unattended
  --name string          Name of the runner to configure (default {Environment.MachineName ?? "myrunner"})
  --runnergroup string   Name of the runner group to add this runner to (defaults to the default runner group)
  --labels string        Custom labels that will be added to the runner. This option is mandatory if --no-default-labels is used.
  --no-default-labels    Disables adding the default labels: 'self-hosted,{Constants.Runner.Platform},{Constants.Runner.PlatformArchitecture}'
- --local                Removes the runner config files from your local machine. Used as an option to the remove command
+	 --local                Removes the runner config files from your local machine. Used as an option to the remove command
  --work string          Relative runner work directory (default {Constants.Path.WorkDirectory})
  --replace              Replace any existing runner with the same name (default false)
  --pat                  GitHub personal access token with repo scope. Used for checking network connectivity when executing `.{separator}run.{ext} --check`
  --disableupdate        Disable self-hosted runner automatic update to the latest released version`
- --ephemeral            Configure the runner to only take one job and then let the service un-configure the runner after the job finishes (default false)");
+	 --ephemeral            Configure the runner to only take one job and then let the service un-configure the runner after the job finishes (default false)");
 
 #if OS_WINDOWS
     _term.WriteLine($@" --runasservice   Run the runner as a service");
@@ -1145,12 +1444,14 @@ Config Options:
 Examples:
  Check GitHub server network connectivity:
   .{separator}run.{ext} --check --url <url> --pat <pat>
- Configure a runner non-interactively:
-  .{separator}config.{ext} --unattended --url <url> --token <token>
- Configure a runner non-interactively, replacing any existing runner with the same name:
-  .{separator}config.{ext} --unattended --url <url> --token <token> --replace [--name <name>]
- Configure a runner non-interactively with three extra labels:
-  .{separator}config.{ext} --unattended --url <url> --token <token> --labels L1,L2,L3");
+	 Add a repository association non-interactively:
+	  .{separator}config.{ext} add-repo --unattended --url <url> --token <token>
+	 Add a repository association, replacing any existing runner with the same name on GitHub:
+	  .{separator}config.{ext} add-repo --unattended --url <url> --token <token> --replace [--name <name>]
+	 Add a repository association with three extra labels:
+	  .{separator}config.{ext} add-repo --unattended --url <url> --token <token> --labels L1,L2,L3
+	 Remove one local repository association:
+	  .{separator}config.{ext} remove-repo --id <id>");
 #if OS_WINDOWS
     _term.WriteLine($@" Configure a runner to run as a service:");
     _term.WriteLine($@"  .{separator}config.{ext} --url <url> --token <token> --runasservice");

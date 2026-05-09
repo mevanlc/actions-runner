@@ -27,6 +27,7 @@ namespace GitHub.Runner.Listener
         private CancellationTokenSource _getMessagesTokenSource;
         private VssCredentials _creds;
         private VssCredentials _credsV2;
+        private CredentialData _credentialData;
         private TaskAgentSession _session;
         private IRunnerServer _runnerServer;
         private IBrokerServer _brokerServer;
@@ -52,13 +53,19 @@ namespace GitHub.Runner.Listener
             _isMigratedSettings = isMigratedSettings;
         }
 
+        public BrokerMessageListener(RunnerSettings settings, CredentialData credentialData)
+        {
+            _settings = settings;
+            _credentialData = credentialData;
+        }
+
         public override void Initialize(IHostContext hostContext)
         {
             base.Initialize(hostContext);
 
             _term = HostContext.GetService<ITerminal>();
-            _runnerServer = HostContext.GetService<IRunnerServer>();
-            _brokerServer = HostContext.GetService<IBrokerServer>();
+            _runnerServer = _credentialData == null ? HostContext.GetService<IRunnerServer>() : HostContext.CreateService<IRunnerServer>();
+            _brokerServer = _credentialData == null ? HostContext.GetService<IBrokerServer>() : HostContext.CreateService<IBrokerServer>();
             _credMgr = HostContext.GetService<ICredentialManager>();
         }
 
@@ -93,7 +100,7 @@ namespace GitHub.Runner.Listener
 
             // Create connection.
             Trace.Info("Loading Credentials");
-            _creds = _credMgr.LoadCredentials(allowAuthUrlV2: false);
+            _creds = LoadCredentials(allowAuthUrlV2: false);
 
             var agent = new TaskAgentReference
             {
@@ -116,7 +123,7 @@ namespace GitHub.Runner.Listener
                 try
                 {
                     Trace.Info("Connecting to the Broker Server...");
-                    _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+                    _credsV2 = LoadCredentials(allowAuthUrlV2: true);
                     await _brokerServer.ConnectAsync(new Uri(serverUrlV2), _credsV2);
                     Trace.Info("VssConnection created");
 
@@ -526,9 +533,16 @@ namespace GitHub.Runner.Listener
         private async Task RefreshBrokerConnectionAsync()
         {
             Trace.Info("Reload credentials.");
-            _credsV2 = _credMgr.LoadCredentials(allowAuthUrlV2: true);
+            _credsV2 = LoadCredentials(allowAuthUrlV2: true);
             await _brokerServer.ConnectAsync(new Uri(_settings.ServerUrlV2), _credsV2);
             Trace.Info("Connection to Broker Server recreated.");
+        }
+
+        private VssCredentials LoadCredentials(bool allowAuthUrlV2)
+        {
+            return _credentialData == null
+                ? _credMgr.LoadCredentials(allowAuthUrlV2)
+                : _credMgr.LoadCredentials(_credentialData, allowAuthUrlV2);
         }
 
         private void HandleAuthMigrationChanged(object sender, EventArgs e)
