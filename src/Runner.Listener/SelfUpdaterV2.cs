@@ -28,6 +28,7 @@ namespace GitHub.Runner.Listener
     {
         bool Busy { get; }
         Task<bool> SelfUpdate(RunnerRefreshMessage updateMessage, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token);
+        Task<bool> SelfUpdate(string targetVersion, string downloadUrl, string sha256Checksum, string os, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token);
     }
     public class SelfUpdaterV2 : RunnerService, ISelfUpdaterV2
     {
@@ -56,19 +57,24 @@ namespace GitHub.Runner.Listener
 
         public async Task<bool> SelfUpdate(RunnerRefreshMessage updateMessage, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token)
         {
+            return await SelfUpdate(updateMessage.TargetVersion, updateMessage.DownloadUrl, updateMessage.SHA256Checksum, updateMessage.OS, jobDispatcher, restartInteractiveRunner, token);
+        }
+
+        public async Task<bool> SelfUpdate(string targetVersion, string downloadUrl, string sha256Checksum, string os, IJobDispatcher jobDispatcher, bool restartInteractiveRunner, CancellationToken token)
+        {
             Busy = true;
             try
             {
                 var totalUpdateTime = Stopwatch.StartNew();
 
                 Trace.Info($"An update is available.");
-                _updateTrace.Enqueue($"RunnerPlatform: {updateMessage.OS}");
+                _updateTrace.Enqueue($"RunnerPlatform: {os}");
 
                 // Print console line that warn user not shutdown runner.
                 _terminal.WriteLine("Runner update in progress, do not shutdown runner.");
-                _terminal.WriteLine($"Downloading {updateMessage.TargetVersion} runner");
+                _terminal.WriteLine($"Downloading {targetVersion} runner");
 
-                await DownloadLatestRunner(token, updateMessage.TargetVersion, updateMessage.DownloadUrl, updateMessage.SHA256Checksum, updateMessage.OS);
+                await DownloadLatestRunner(token, targetVersion, downloadUrl, sha256Checksum, os);
                 Trace.Info($"Download latest runner and unzip into runner root.");
 
                 // wait till all running job finish
@@ -80,14 +86,14 @@ namespace GitHub.Runner.Listener
                 // We need to keep runner backup around for macOS until we fixed https://github.com/actions/runner/issues/743
                 // delete runner backup
                 var stopWatch = Stopwatch.StartNew();
-                DeletePreviousVersionRunnerBackup(token, updateMessage.TargetVersion);
+                DeletePreviousVersionRunnerBackup(token, targetVersion);
                 Trace.Info($"Delete old version runner backup.");
                 stopWatch.Stop();
                 // generate update script from template
                 _updateTrace.Enqueue($"DeleteRunnerBackupTime: {stopWatch.ElapsedMilliseconds}ms");
                 _terminal.WriteLine("Generate and execute update script.");
 
-                string updateScript = GenerateUpdateScript(restartInteractiveRunner, updateMessage.TargetVersion);
+                string updateScript = GenerateUpdateScript(restartInteractiveRunner, targetVersion);
                 Trace.Info($"Generate update script into: {updateScript}");
 
 

@@ -517,10 +517,10 @@ namespace GitHub.Runner.Listener
 
                     notification.StartClient(settings.MonitorSocketAddress);
 
-                    bool autoUpdateInProgress = false;
-                    Task<bool> selfUpdateTask = null;
                     bool runOnceJobReceived = false;
                     jobDispatcher = HostContext.CreateService<IJobDispatcher>();
+                    var releaseUpdatePoller = HostContext.CreateService<IReleaseUpdatePoller>();
+                    releaseUpdatePoller.Start(jobDispatcher, false, HostContext.RunnerShutdownToken);
 
                     jobDispatcher.JobStatus += _listener.OnJobStatus;
 
@@ -540,16 +540,14 @@ namespace GitHub.Runner.Listener
                         try
                         {
                             Task<TaskAgentMessage> getNextMessage = _listener.GetNextMessageAsync(messageQueueLoopTokenSource.Token);
-                            if (autoUpdateInProgress)
+                            if (releaseUpdatePoller.Enabled)
                             {
-                                Trace.Verbose("Auto update task running at backend, waiting for getNextMessage or selfUpdateTask to finish.");
-                                Task completeTask = await Task.WhenAny(getNextMessage, selfUpdateTask);
-                                if (completeTask == selfUpdateTask)
+                                Task completeTask = await Task.WhenAny(getNextMessage, releaseUpdatePoller.UpdateReady);
+                                if (completeTask == releaseUpdatePoller.UpdateReady)
                                 {
-                                    autoUpdateInProgress = false;
-                                    if (await selfUpdateTask)
+                                    if (await releaseUpdatePoller.UpdateReady)
                                     {
-                                        Trace.Info("Auto update task finished at backend, an runner update is ready to apply exit the current runner instance.");
+                                        Trace.Info("Release update task finished at backend, a runner update is ready to apply exit the current runner instance.");
                                         Trace.Info("Stop message queue looping.");
                                         messageQueueLoopTokenSource.Cancel();
                                         try
@@ -569,10 +567,6 @@ namespace GitHub.Runner.Listener
                                         {
                                             return Constants.Runner.ReturnCode.RunnerUpdating;
                                         }
-                                    }
-                                    else
-                                    {
-                                        Trace.Info("Auto update task finished at backend, there is no available runner update needs to apply, continue message queue looping.");
                                     }
                                 }
                             }
@@ -619,60 +613,15 @@ namespace GitHub.Runner.Listener
                             HostContext.WritePerfCounter($"MessageReceived_{message.MessageType}");
                             if (string.Equals(message.MessageType, AgentRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
                             {
-                                if (autoUpdateInProgress == false)
-                                {
-                                    autoUpdateInProgress = true;
-                                    AgentRefreshMessage runnerUpdateMessage = JsonUtility.FromString<AgentRefreshMessage>(message.Body);
-
-#if DEBUG
-                                    // Can mock the update for testing
-                                    if (StringUtil.ConvertToBoolean(Environment.GetEnvironmentVariable("GITHUB_ACTIONS_RUNNER_IS_MOCK_UPDATE")))
-                                    {
-
-                                        // The mock_update_messages.json file should be an object with keys being the current version and values being the targeted mock version object
-                                        // Example: { "2.283.2": {"targetVersion":"2.284.1"}, "2.284.1": {"targetVersion":"2.285.0"}}
-                                        var mockUpdatesPath = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Root), "mock_update_messages.json");
-                                        if (File.Exists(mockUpdatesPath))
-                                        {
-                                            var mockUpdateMessages = JsonUtility.FromString<Dictionary<string, AgentRefreshMessage>>(File.ReadAllText(mockUpdatesPath));
-                                            if (mockUpdateMessages.ContainsKey(BuildConstants.RunnerPackage.Version))
-                                            {
-                                                var mockTargetVersion = mockUpdateMessages[BuildConstants.RunnerPackage.Version].TargetVersion;
-                                                _term.WriteLine($"Mocking update, using version {mockTargetVersion} instead of {runnerUpdateMessage.TargetVersion}");
-                                                Trace.Info($"Mocking update, using version {mockTargetVersion} instead of {runnerUpdateMessage.TargetVersion}");
-                                                runnerUpdateMessage = new AgentRefreshMessage(runnerUpdateMessage.AgentId, mockTargetVersion, runnerUpdateMessage.Timeout);
-                                            }
-                                        }
-                                    }
-#endif
-                                    var selfUpdater = HostContext.GetService<ISelfUpdater>();
-                                    selfUpdateTask = selfUpdater.SelfUpdate(runnerUpdateMessage, jobDispatcher, false, HostContext.RunnerShutdownToken);
-                                    Trace.Info("Refresh message received, kick-off selfupdate background process.");
-                                }
-                                else
-                                {
-                                    Trace.Info("Refresh message received, skip autoupdate since a previous autoupdate is already running.");
-                                }
+                                Trace.Info("Ignoring service-directed runner update message. Release polling controls runner self-update.");
                             }
                             else if (string.Equals(message.MessageType, RunnerRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
                             {
-                                if (autoUpdateInProgress == false)
-                                {
-                                    autoUpdateInProgress = true;
-                                    RunnerRefreshMessage brokerRunnerUpdateMessage = JsonUtility.FromString<RunnerRefreshMessage>(message.Body);
-
-                                    var selfUpdater = HostContext.GetService<ISelfUpdaterV2>();
-                                    selfUpdateTask = selfUpdater.SelfUpdate(brokerRunnerUpdateMessage, jobDispatcher, false, HostContext.RunnerShutdownToken);
-                                    Trace.Info("Refresh message received, kick-off selfupdate background process.");
-                                }
-                                else
-                                {
-                                    Trace.Info("Refresh message received, skip autoupdate since a previous autoupdate is already running.");
-                                }
+                                Trace.Info("Ignoring service-directed broker runner update message. Release polling controls runner self-update.");
                             }
                             else if (string.Equals(message.MessageType, JobRequestMessageTypes.PipelineAgentJobRequest, StringComparison.OrdinalIgnoreCase))
                             {
-                                if (autoUpdateInProgress || runOnceJobReceived)
+                                if (releaseUpdatePoller.Busy || runOnceJobReceived)
                                 {
                                     skipMessageDeletion = true;
                                     Trace.Info($"Skip message deletion for job request message '{message.MessageId}'.");
@@ -692,7 +641,7 @@ namespace GitHub.Runner.Listener
                             // Broker flow
                             else if (MessageUtil.IsRunServiceJob(message.MessageType))
                             {
-                                if (autoUpdateInProgress || runOnceJobReceived)
+                                if (releaseUpdatePoller.Busy || runOnceJobReceived)
                                 {
                                     skipMessageDeletion = true;
                                     Trace.Info($"Skip message deletion for job request message '{message.MessageId}'.");
@@ -779,7 +728,7 @@ namespace GitHub.Runner.Listener
                             {
                                 var cancelJobMessage = JsonUtility.FromString<JobCancelMessage>(message.Body);
                                 bool jobCancelled = jobDispatcher.Cancel(cancelJobMessage);
-                                skipMessageDeletion = (autoUpdateInProgress || runOnceJobReceived) && !jobCancelled;
+                                skipMessageDeletion = (releaseUpdatePoller.Busy || runOnceJobReceived) && !jobCancelled;
 
                                 if (skipMessageDeletion)
                                 {
@@ -971,6 +920,9 @@ namespace GitHub.Runner.Listener
                 jobDispatcher.JobStatus += vrn.Listener.OnJobStatus;
             }
 
+            var releaseUpdatePoller = HostContext.CreateService<IReleaseUpdatePoller>();
+            releaseUpdatePoller.Start(jobDispatcher, false, HostContext.RunnerShutdownToken);
+
             bool runOnceJobReceived = false;
             Task executionSlotTask = null;
             try
@@ -995,8 +947,30 @@ namespace GitHub.Runner.Listener
                     var waitTasks = executionSlotTask == null
                         ? polls.Cast<Task>().ToList()
                         : polls.Cast<Task>().Append(executionSlotTask).ToList();
+                    if (releaseUpdatePoller.Enabled)
+                    {
+                        waitTasks.Add(releaseUpdatePoller.UpdateReady);
+                    }
+
                     var completed = await Task.WhenAny(waitTasks);
                     pollCts.Cancel();
+
+                    if (completed == releaseUpdatePoller.UpdateReady)
+                    {
+                        await ObservePollCancellationAsync(polls, completed);
+                        if (await releaseUpdatePoller.UpdateReady)
+                        {
+                            Trace.Info("Release update task finished at backend, a runner update is ready to apply exit the current runner instance.");
+                            if (runOnce)
+                            {
+                                return Constants.Runner.ReturnCode.RunOnceRunnerUpdating;
+                            }
+
+                            return Constants.Runner.ReturnCode.RunnerUpdating;
+                        }
+
+                        continue;
+                    }
 
                     if (completed == executionSlotTask)
                     {
@@ -1028,7 +1002,7 @@ namespace GitHub.Runner.Listener
                         continue;
                     }
 
-                    bool executionSlotOccupied = executionSlotTask != null && !executionSlotTask.IsCompleted;
+                    bool executionSlotOccupied = releaseUpdatePoller.Busy || executionSlotTask != null && !executionSlotTask.IsCompleted;
                     bool jobStarted = await ProcessMultiRunnerMessageAsync(candidate, jobDispatcher, runOnce, runOnceJobReceived, executionSlotOccupied);
                     runOnceJobReceived = runOnceJobReceived || (runOnce && jobStarted);
                     if (runOnceJobReceived)
@@ -1220,6 +1194,13 @@ namespace GitHub.Runner.Listener
                 {
                     var cancelJobMessage = JsonUtility.FromString<JobCancelMessage>(message.Body);
                     jobDispatcher.Cancel(cancelJobMessage);
+                    return false;
+                }
+
+                if (string.Equals(message.MessageType, AgentRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(message.MessageType, RunnerRefreshMessage.MessageType, StringComparison.OrdinalIgnoreCase))
+                {
+                    Trace.Info($"Ignoring service-directed runner update message '{message.MessageType}' for association '{vrn.Association.Id}'. Release polling controls runner self-update.");
                     return false;
                 }
 

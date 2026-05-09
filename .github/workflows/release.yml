@@ -98,6 +98,7 @@ jobs:
     - name: Package Release
       if: github.event_name != 'pull_request'
       run: |
+        echo '${{ github.repository }}' > ../_layout/.runner-release-source
         ${{ matrix.devScript }} package Release ${{ matrix.runtime }}
       working-directory: src
 
