@@ -24,7 +24,7 @@ namespace GitHub.Runner.Common.Tests.Listener
         private Mock<IRunnerServer> _runnerServer;
         private Mock<ITerminal> _term;
         private Mock<IConfigurationStore> _configStore;
-        private Mock<ISelfUpdater> _updater;
+        private Mock<IReleaseUpdatePoller> _releaseUpdatePoller;
         private Mock<IErrorThrottler> _acquireJobThrottler;
         private Mock<ICredentialManager> _credentialManager;
         private Mock<IActionsRunServer> _actionsRunServer;
@@ -41,7 +41,7 @@ namespace GitHub.Runner.Common.Tests.Listener
             _runnerServer = new Mock<IRunnerServer>();
             _term = new Mock<ITerminal>();
             _configStore = new Mock<IConfigurationStore>();
-            _updater = new Mock<ISelfUpdater>();
+            _releaseUpdatePoller = new Mock<IReleaseUpdatePoller>();
             _acquireJobThrottler = new Mock<IErrorThrottler>();
             _credentialManager = new Mock<ICredentialManager>();
             _actionsRunServer = new Mock<IActionsRunServer>();
@@ -68,6 +68,16 @@ namespace GitHub.Runner.Common.Tests.Listener
         {
             var message = new JobCancelMessage(Guid.NewGuid(), TimeSpan.FromSeconds(0));
             return message;
+        }
+
+        private void EnqueueDisabledReleaseUpdatePoller(TestHostContext hc)
+        {
+            _releaseUpdatePoller.SetupGet(x => x.Enabled).Returns(false);
+            _releaseUpdatePoller.SetupGet(x => x.Busy).Returns(false);
+            _releaseUpdatePoller.SetupGet(x => x.UpdateReady).Returns(Task.FromResult(false));
+            _releaseUpdatePoller
+                .Setup(x => x.Start(It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()));
+            hc.EnqueueInstance<IReleaseUpdatePoller>(_releaseUpdatePoller.Object);
         }
 
         [Fact]
@@ -136,6 +146,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                     });
 
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
                 //Act
@@ -319,6 +330,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                     });
 
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
                 //Act
@@ -423,6 +435,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                     });
 
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
                 //Act
@@ -452,7 +465,7 @@ namespace GitHub.Runner.Common.Tests.Listener
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Runner")]
-        public async Task TestRunOnceHandleUpdateMessage()
+        public async Task TestRunOnceIgnoresServiceUpdateMessage()
         {
             using (var hc = new TestHostContext(this))
             {
@@ -464,7 +477,6 @@ namespace GitHub.Runner.Common.Tests.Listener
                 hc.SetSingleton<IPromptManager>(_promptManager.Object);
                 hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
-                hc.SetSingleton<ISelfUpdater>(_updater.Object);
                 hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
 
                 runner.Initialize(hc);
@@ -475,17 +487,22 @@ namespace GitHub.Runner.Common.Tests.Listener
                     Ephemeral = true
                 };
 
-                var message1 = new TaskAgentMessage()
+                var updateMessage = new TaskAgentMessage()
                 {
                     Body = JsonUtility.ToString(new AgentRefreshMessage(settings.AgentId, "2.123.0")),
                     MessageId = 4234,
                     MessageType = AgentRefreshMessage.MessageType
                 };
+                var jobMessage = new TaskAgentMessage()
+                {
+                    Body = JsonUtility.ToString(CreateJobRequestMessage("job1")),
+                    MessageId = 4235,
+                    MessageType = JobRequestMessageTypes.PipelineAgentJobRequest
+                };
 
                 var messages = new Queue<TaskAgentMessage>();
-                messages.Enqueue(message1);
-                _updater.Setup(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                        .Returns(Task.FromResult(true));
+                messages.Enqueue(updateMessage);
+                messages.Enqueue(jobMessage);
                 _configurationManager.Setup(x => x.LoadSettings())
                     .Returns(settings);
                 _configurationManager.Setup(x => x.IsConfigured())
@@ -493,11 +510,11 @@ namespace GitHub.Runner.Common.Tests.Listener
                 _messageListener.Setup(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()))
                     .Returns(Task.FromResult<CreateSessionResult>(CreateSessionResult.Success));
                 _messageListener.Setup(x => x.GetNextMessageAsync(It.IsAny<CancellationToken>()))
-                    .Returns(async () =>
+                    .Returns(async (CancellationToken token) =>
                         {
                             if (0 == messages.Count)
                             {
-                                await Task.Delay(2000);
+                                await Task.Delay(2000, token);
                             }
 
                             return messages.Dequeue();
@@ -511,8 +528,17 @@ namespace GitHub.Runner.Common.Tests.Listener
                     {
 
                     });
+                var runOnceJobCompleted = new TaskCompletionSource<TaskResult>();
+                _jobDispatcher.Setup(x => x.RunOnceJobCompleted)
+                    .Returns(runOnceJobCompleted);
+                _jobDispatcher.Setup(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), It.IsAny<bool>()))
+                    .Callback(() =>
+                    {
+                        runOnceJobCompleted.TrySetResult(TaskResult.Succeeded);
+                    });
 
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
                 //Act
@@ -527,15 +553,14 @@ namespace GitHub.Runner.Common.Tests.Listener
                 Assert.True(!runnerTask.IsFaulted, runnerTask.Exception?.ToString());
                 if (runnerTask.IsCompleted)
                 {
-                    Assert.Equal(Constants.Runner.ReturnCode.RunOnceRunnerUpdating, await runnerTask);
+                    Assert.Equal(Constants.Runner.ReturnCode.Success, await runnerTask);
                 }
 
-                _updater.Verify(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), false, It.IsAny<CancellationToken>()), Times.Once);
-                _jobDispatcher.Verify(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), true), Times.Never());
+                _jobDispatcher.Verify(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), true), Times.Once());
                 _messageListener.Verify(x => x.GetNextMessageAsync(It.IsAny<CancellationToken>()), Times.AtLeastOnce());
                 _messageListener.Verify(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()), Times.Once());
                 _messageListener.Verify(x => x.DeleteSessionAsync(), Times.Once());
-                _messageListener.Verify(x => x.DeleteMessageAsync(It.IsAny<TaskAgentMessage>()), Times.Once());
+                _messageListener.Verify(x => x.DeleteMessageAsync(It.IsAny<TaskAgentMessage>()), Times.Exactly(2));
             }
         }
 
@@ -588,6 +613,7 @@ namespace GitHub.Runner.Common.Tests.Listener
                 hc.SetSingleton<ICredentialManager>(_credentialManager.Object);
                 hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 runner.Initialize(hc);
                 var settings = new RunnerSettings
@@ -605,8 +631,6 @@ namespace GitHub.Runner.Common.Tests.Listener
 
                 var messages = new Queue<TaskAgentMessage>();
                 messages.Enqueue(message1);
-                _updater.Setup(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                        .Returns(Task.FromResult(true));
                 _configurationManager.Setup(x => x.LoadSettings())
                     .Returns(settings);
                 _configurationManager.Setup(x => x.IsConfigured())
@@ -684,11 +708,11 @@ namespace GitHub.Runner.Common.Tests.Listener
                 hc.SetSingleton<IPromptManager>(_promptManager.Object);
                 hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
-                hc.SetSingleton<ISelfUpdater>(_updater.Object);
                 hc.SetSingleton<ICredentialManager>(_credentialManager.Object);
                 hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
                 hc.EnqueueInstance<IActionsRunServer>(_actionsRunServer.Object);
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 runner.Initialize(hc);
                 var settings = new RunnerSettings
@@ -708,8 +732,6 @@ namespace GitHub.Runner.Common.Tests.Listener
 
                 var messages = new Queue<TaskAgentMessage>();
                 messages.Enqueue(message1);
-                _updater.Setup(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                        .Returns(Task.FromResult(true));
                 _configurationManager.Setup(x => x.LoadSettings())
                     .Returns(settings);
                 _configurationManager.Setup(x => x.IsConfigured())
@@ -785,11 +807,11 @@ namespace GitHub.Runner.Common.Tests.Listener
                 hc.SetSingleton<IPromptManager>(_promptManager.Object);
                 hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
-                hc.SetSingleton<ISelfUpdater>(_updater.Object);
                 hc.SetSingleton<ICredentialManager>(_credentialManager.Object);
                 hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
                 hc.EnqueueInstance<IRunServer>(_runServer.Object);
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 runner.Initialize(hc);
                 var settings = new RunnerSettings
@@ -809,8 +831,6 @@ namespace GitHub.Runner.Common.Tests.Listener
 
                 var messages = new Queue<TaskAgentMessage>();
                 messages.Enqueue(message1);
-                _updater.Setup(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                        .Returns(Task.FromResult(true));
                 _configurationManager.Setup(x => x.LoadSettings())
                     .Returns(settings);
                 _configurationManager.Setup(x => x.IsConfigured())
@@ -886,12 +906,12 @@ namespace GitHub.Runner.Common.Tests.Listener
                 hc.SetSingleton<IPromptManager>(_promptManager.Object);
                 hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
                 hc.SetSingleton<IConfigurationStore>(_configStore.Object);
-                hc.SetSingleton<ISelfUpdater>(_updater.Object);
                 hc.SetSingleton<ICredentialManager>(_credentialManager.Object);
                 hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
                 hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
                 hc.EnqueueInstance<IRunServer>(_runServer.Object);
                 hc.EnqueueInstance<IRunServer>(_runServer.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
 
                 runner.Initialize(hc);
                 var settings = new RunnerSettings
@@ -912,8 +932,6 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var messages = new Queue<TaskAgentMessage>();
                 messages.Enqueue(message1);
                 messages.Enqueue(message1);
-                _updater.Setup(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                        .Returns(Task.FromResult(true));
                 _configurationManager.Setup(x => x.LoadSettings())
                     .Returns(settings);
                 _configurationManager.Setup(x => x.IsConfigured())
@@ -1030,8 +1048,6 @@ namespace GitHub.Runner.Common.Tests.Listener
                 var messages = new Queue<TaskAgentMessage>();
                 messages.Enqueue(message1);
                 messages.Enqueue(message1);
-                _updater.Setup(x => x.SelfUpdate(It.IsAny<AgentRefreshMessage>(), It.IsAny<IJobDispatcher>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
-                        .Returns(Task.FromResult(true));
                 _configurationManager.Setup(x => x.LoadSettings())
                     .Returns(settings);
                 _configurationManager.Setup(x => x.IsConfigured())

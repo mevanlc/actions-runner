@@ -8,7 +8,6 @@ using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Listener;
 using GitHub.Runner.Sdk;
 using Moq;
@@ -22,7 +21,6 @@ namespace GitHub.Runner.Common.Tests.Listener
         private Mock<ITerminal> _term;
         private Mock<IConfigurationStore> _configStore;
         private Mock<IJobDispatcher> _jobDispatcher;
-        private AgentRefreshMessage _refreshMessage = new(1, "12.999.0");
 
 #if !OS_WINDOWS
         private string _packageUrl = null;
@@ -105,15 +103,8 @@ namespace GitHub.Runner.Common.Tests.Listener
 
                     try
                     {
-                        var message = new RunnerRefreshMessage()
-                        {
-                            TargetVersion = "12.999.0",
-                            OS = BuildConstants.RunnerPackage.PackageName,
-                            DownloadUrl = _packageUrl
-
-                        };
-
-                        var result = await updater.SelfUpdate(message, _jobDispatcher.Object, true, hc.RunnerShutdownToken);
+                        var result = await updater.SelfUpdate("12.999.0", _packageUrl, null, BuildConstants.RunnerPackage.PackageName, _jobDispatcher.Object, true,
+                            hc.RunnerShutdownToken);
                         Assert.True(result);
                         Assert.True(Directory.Exists(Path.Combine(hc.GetDirectory(WellKnownDirectory.Root), "bin.12.999.0")));
                         Assert.True(Directory.Exists(Path.Combine(hc.GetDirectory(WellKnownDirectory.Root), "externals.12.999.0")));
@@ -163,14 +154,8 @@ namespace GitHub.Runner.Common.Tests.Listener
                     hc.EnqueueInstance<IProcessInvoker>(p3);
                     updater.Initialize(hc);
 
-                    var message = new RunnerRefreshMessage()
-                    {
-                        TargetVersion = "12.999.0",
-                        OS = BuildConstants.RunnerPackage.PackageName,
-                        DownloadUrl = "https://github.com/actions/runner/notexists"
-                    };
-
-                    var result = await updater.SelfUpdate(message, _jobDispatcher.Object, true, hc.RunnerShutdownToken);
+                    var result = await updater.SelfUpdate("12.999.0", "https://github.com/actions/runner/notexists", null, BuildConstants.RunnerPackage.PackageName, _jobDispatcher.Object, true,
+                        hc.RunnerShutdownToken);
                     Assert.False(result);
                 }
             }
@@ -212,15 +197,8 @@ namespace GitHub.Runner.Common.Tests.Listener
                     hc.EnqueueInstance<IProcessInvoker>(p3);
                     updater.Initialize(hc);
 
-                    var message = new RunnerRefreshMessage()
-                    {
-                        TargetVersion = "12.999.0",
-                        OS = BuildConstants.RunnerPackage.PackageName,
-                        DownloadUrl = _packageUrl,
-                        SHA256Checksum = "badhash"
-                    };
-
-                    var result = await updater.SelfUpdate(message, _jobDispatcher.Object, true, hc.RunnerShutdownToken);
+                    var result = await updater.SelfUpdate("12.999.0", _packageUrl, "badhash", BuildConstants.RunnerPackage.PackageName, _jobDispatcher.Object, true,
+                        hc.RunnerShutdownToken);
                     Assert.False(result);
                 }
             }
