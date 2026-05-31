@@ -1221,7 +1221,32 @@ namespace GitHub.Runner.Listener
                         var credsV2 = credMgr.LoadCredentials(vrn.CredentialData, allowAuthUrlV2: true);
                         var runServer = HostContext.CreateService<IRunServer>();
                         await runServer.ConnectAsync(new Uri(messageRef.RunServiceUrl), credsV2);
-                        jobRequestMessage = await runServer.GetJobMessageAsync(messageRef.RunnerRequestId, messageRef.BillingOwnerId, HostContext.RunnerShutdownToken);
+                        try
+                        {
+                            jobRequestMessage = await runServer.GetJobMessageAsync(messageRef.RunnerRequestId, messageRef.BillingOwnerId, HostContext.RunnerShutdownToken);
+                            _acquireJobThrottler.Reset();
+                        }
+                        catch (Exception ex) when (
+                            ex is TaskOrchestrationJobNotFoundException ||          // HTTP status 404
+                            ex is TaskOrchestrationJobAlreadyAcquiredException ||   // HTTP status 409
+                            ex is TaskOrchestrationJobUnprocessableException)       // HTTP status 422
+                        {
+                            Trace.Info($"Skipping message Job for association '{vrn.Association.Id}'. {ex.Message}");
+                            await _acquireJobThrottler.IncrementAndWaitAsync(HostContext.RunnerShutdownToken);
+                            return false;
+                        }
+                        catch (Exception ex)
+                        {
+                            Trace.Error($"Caught exception from acquiring job message for association '{vrn.Association.Id}': {ex}");
+
+                            if (HostContext.AllowAuthMigration)
+                            {
+                                Trace.Info("Disable migration mode for 60 minutes.");
+                                HostContext.DeferAuthMigration(TimeSpan.FromMinutes(60), $"Acquire job failed with exception: {ex}");
+                            }
+
+                            return false;
+                        }
                     }
 
                     if (messageRef.ShouldAcknowledge)

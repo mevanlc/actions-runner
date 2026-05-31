@@ -438,6 +438,59 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Worker")]
+        public async Task JobCompletedHookRunsAfterJobCancellation()
+        {
+            Environment.SetEnvironmentVariable(Constants.Hooks.JobCompletedHookPath, "/bar/foo");
+            try
+            {
+                using (TestHostContext hc = CreateTestContext())
+                {
+                    var jobExtension = new JobExtension();
+                    jobExtension.Initialize(hc);
+
+                    _actionManager.Setup(x => x.PrepareActionsAsync(It.IsAny<IExecutionContext>(), It.IsAny<IEnumerable<Pipelines.JobStep>>(), It.IsAny<Guid>()))
+                                  .Returns(Task.FromResult(new PrepareResult(new List<JobExtensionRunner>(), new Dictionary<Guid, IActionRunner>())));
+
+                    await jobExtension.InitializeJob(_jobEc, _message);
+
+                    var cancellingStep = new JobExtensionRunner(
+                        runAsync: (_, _) =>
+                        {
+                            _tokenSource.Cancel();
+                            return Task.CompletedTask;
+                        },
+                        condition: "success()",
+                        displayName: "cancel job",
+                        data: null);
+                    cancellingStep.ExecutionContext = _jobEc.CreateChild(Guid.NewGuid(), "cancel job", "cancel_job", null, null, ActionRunStage.Main);
+                    _jobEc.JobSteps.Enqueue(cancellingStep);
+
+                    var stepsRunner = new StepsRunner();
+                    hc.SetSingleton(new Mock<IDapDebugger>().Object);
+                    stepsRunner.Initialize(hc);
+
+                    await stepsRunner.RunAsync(_jobEc);
+
+                    Assert.Equal(TaskResult.Canceled, _jobEc.Result);
+                    _jobHookProvider.Verify(x => x.RunHook(
+                        It.IsAny<IExecutionContext>(),
+                        It.Is<object>(data =>
+                            data != null &&
+                            data.GetType() == typeof(JobHookData) &&
+                            ((JobHookData)data).Stage == ActionRunStage.Post &&
+                            ((JobHookData)data).Path == "/bar/foo")),
+                        Times.Once);
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(Constants.Hooks.JobCompletedHookPath, null);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Worker")]
         public async Task EnsureNoPreAndPostHookSteps()
         {
             using (TestHostContext hc = CreateTestContext())

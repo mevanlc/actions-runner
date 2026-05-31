@@ -1106,6 +1106,159 @@ namespace GitHub.Runner.Common.Tests.Listener
         [Fact]
         [Trait("Level", "L0")]
         [Trait("Category", "Runner")]
+        public async Task TestMultiRunnerRunServiceStaleJobRequestKeepsPolling()
+        {
+            using (var hc = new TestHostContext(this))
+            {
+                //Arrange
+                var runner = new Runner.Listener.Runner();
+                var brokerServer = new Mock<IBrokerServer>();
+                hc.SetSingleton<IConfigurationManager>(_configurationManager.Object);
+                hc.SetSingleton<IJobNotification>(_jobNotification.Object);
+                hc.SetSingleton<IPromptManager>(_promptManager.Object);
+                hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
+                hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<ICredentialManager>(_credentialManager.Object);
+                hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
+                hc.EnqueueInstance<IJobDispatcher>(_jobDispatcher.Object);
+                hc.EnqueueInstance<IRunnerServer>(_runnerServer.Object);
+                hc.EnqueueInstance<IBrokerServer>(brokerServer.Object);
+                hc.EnqueueInstance<IRunServer>(_runServer.Object);
+                hc.EnqueueInstance<IRunServer>(_runServer.Object);
+                EnqueueDisabledReleaseUpdatePoller(hc);
+
+                runner.Initialize(hc);
+                var association = new RunnerAssociation
+                {
+                    Id = "repo1",
+                    Url = "https://github.com/octo/repo1",
+                    AgentId = 5678,
+                    AgentName = "runner",
+                    PoolId = 43242,
+                    ServerUrl = "https://github.com",
+                    CredentialRef = "repo1",
+                };
+                var multiSettings = new MultiRunnerSettings
+                {
+                    Associations = new List<RunnerAssociation> { association },
+                };
+                var credential = new CredentialData
+                {
+                    Scheme = Constants.Configuration.OAuthAccessToken,
+                };
+                var session = new TaskAgentSession();
+                var sessionIdProperty = session.GetType().GetProperty("SessionId");
+                Assert.NotNull(sessionIdProperty);
+                sessionIdProperty.SetValue(session, Guid.NewGuid());
+                var staleMessage = new TaskAgentMessage
+                {
+                    Body = JsonUtility.ToString(new RunnerJobRequestRef
+                    {
+                        BillingOwnerId = "github",
+                        RunnerRequestId = "stale",
+                        RunServiceUrl = "https://run-service.com",
+                    }),
+                    MessageId = 4234,
+                    MessageType = JobRequestMessageTypes.RunnerJobRequest
+                };
+                var replacementMessage = new TaskAgentMessage
+                {
+                    Body = JsonUtility.ToString(new RunnerJobRequestRef
+                    {
+                        BillingOwnerId = "github",
+                        RunnerRequestId = "replacement",
+                        RunServiceUrl = "https://run-service.com",
+                    }),
+                    MessageId = 4235,
+                    MessageType = JobRequestMessageTypes.RunnerJobRequest
+                };
+                var messages = new Queue<TaskAgentMessage>();
+                messages.Enqueue(staleMessage);
+                messages.Enqueue(replacementMessage);
+                var replacementJobDispatched = new SemaphoreSlim(0, 1);
+
+                _configurationManager.Setup(x => x.LoadMultiSettings())
+                    .Returns(multiSettings);
+                _configurationManager.Setup(x => x.IsConfigured())
+                    .Returns(true);
+                _configStore.Setup(x => x.IsServiceConfigured())
+                    .Returns(false);
+                _configStore.Setup(x => x.GetCredential("repo1"))
+                    .Returns(credential);
+                _runnerServer.Setup(x => x.CreateAgentSessionAsync(association.PoolId, It.IsAny<TaskAgentSession>(), It.IsAny<CancellationToken>()))
+                    .Returns(Task.FromResult(session));
+                _runnerServer.Setup(x => x.GetAgentMessageAsync(
+                        association.PoolId,
+                        It.IsAny<Guid>(),
+                        It.IsAny<long?>(),
+                        It.IsAny<TaskAgentStatus>(),
+                        It.IsAny<string>(),
+                        It.IsAny<string>(),
+                        It.IsAny<string>(),
+                        It.IsAny<bool>(),
+                        It.IsAny<CancellationToken>()))
+                    .Returns(async (int poolId, Guid sessionId, long? lastMessageId, TaskAgentStatus status, string runnerVersion, string os, string architecture, bool disableUpdate, CancellationToken token) =>
+                    {
+                        if (messages.Count == 0)
+                        {
+                            await Task.Delay(2000, token);
+                        }
+
+                        return messages.Dequeue();
+                    });
+                _credentialManager.Setup(x => x.LoadCredentials(credential, false))
+                    .Returns(new VssCredentials());
+                _credentialManager.Setup(x => x.LoadCredentials(credential, true))
+                    .Returns(new VssCredentials());
+                _runServer.Setup(x => x.GetJobMessageAsync("stale", "github", It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(new TaskOrchestrationJobNotFoundException("job was replaced"));
+                _runServer.Setup(x => x.GetJobMessageAsync("replacement", "github", It.IsAny<CancellationToken>()))
+                    .Returns(Task.FromResult(CreateJobRequestMessage("replacement")));
+                _acquireJobThrottler.Setup(x => x.IncrementAndWaitAsync(It.IsAny<CancellationToken>()))
+                    .Returns(Task.CompletedTask);
+                _jobDispatcher.SetupGet(x => x.Busy)
+                    .Returns(false);
+                _jobDispatcher.Setup(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), It.IsAny<RunnerSettings>(), It.IsAny<string>(), It.IsAny<bool>()))
+                    .Callback(() => replacementJobDispatched.Release());
+                _jobDispatcher.Setup(x => x.WaitAsync(It.IsAny<CancellationToken>()))
+                    .Returns(async (CancellationToken token) => await Task.Delay(2000, token));
+                _jobDispatcher.Setup(x => x.ShutdownAsync())
+                    .Returns(Task.CompletedTask);
+                _jobNotification.Setup(x => x.StartClient(It.IsAny<string>()));
+
+                //Act
+                var command = new CommandSettings(hc, new string[] { "run" });
+                Task<int> runnerTask = runner.ExecuteCommand(command);
+
+                //Assert
+                Assert.True(await replacementJobDispatched.WaitAsync(2000), "Runner did not dispatch the replacement job after the stale Run Service job request.");
+                hc.ShutdownRunner(ShutdownReason.UserCancelled);
+                await Task.WhenAny(runnerTask, Task.Delay(2000));
+
+                Assert.True(runnerTask.IsCompleted, $"{nameof(runner.ExecuteCommand)} timed out.");
+                Assert.True(!runnerTask.IsFaulted, runnerTask.Exception?.ToString());
+                _runServer.Verify(x => x.GetJobMessageAsync("stale", "github", It.IsAny<CancellationToken>()), Times.Once());
+                _runServer.Verify(x => x.GetJobMessageAsync("replacement", "github", It.IsAny<CancellationToken>()), Times.Once());
+                _acquireJobThrottler.Verify(x => x.IncrementAndWaitAsync(It.IsAny<CancellationToken>()), Times.Once());
+                _runnerServer.Verify(x => x.GetAgentMessageAsync(
+                    association.PoolId,
+                    It.IsAny<Guid>(),
+                    It.IsAny<long?>(),
+                    It.IsAny<TaskAgentStatus>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<bool>(),
+                    It.IsAny<CancellationToken>()), Times.AtLeast(2));
+                _runnerServer.Verify(x => x.DeleteAgentMessageAsync(association.PoolId, staleMessage.MessageId, It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once());
+                _runnerServer.Verify(x => x.DeleteAgentMessageAsync(association.PoolId, replacementMessage.MessageId, It.IsAny<Guid>(), It.IsAny<CancellationToken>()), Times.Once());
+                _jobDispatcher.Verify(x => x.Run(It.IsAny<Pipelines.AgentJobRequestMessage>(), It.IsAny<RunnerSettings>(), "octo/repo1", false), Times.Once());
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
         public async Task TestRunnerEnableAuthMigrationByDefault()
         {
             using (var hc = new TestHostContext(this))
