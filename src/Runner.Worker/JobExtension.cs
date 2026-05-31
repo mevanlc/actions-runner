@@ -284,7 +284,7 @@ namespace GitHub.Runner.Worker
                     var prepareResult = await actionManager.PrepareActionsAsync(context, message.Steps);
 
                     // add hook to preJobSteps
-                    var startedHookPath = Environment.GetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_STARTED");
+                    var startedHookPath = Environment.GetEnvironmentVariable(Constants.Hooks.JobStartedHookPath);
                     if (!string.IsNullOrEmpty(startedHookPath))
                     {
                         var hookProvider = HostContext.GetService<IJobHookProvider>();
@@ -427,7 +427,7 @@ namespace GitHub.Runner.Worker
                     }
 
                     // Register Job Completed hook if the variable is set
-                    var completedHookPath = Environment.GetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_COMPLETED");
+                    var completedHookPath = Environment.GetEnvironmentVariable(Constants.Hooks.JobCompletedHookPath);
                     if (!string.IsNullOrEmpty(completedHookPath))
                     {
                         var hookProvider = HostContext.GetService<IJobHookProvider>();

@@ -19,7 +19,9 @@ This feature is mainly intended for self hosted runner administrators.
 - Security applications, security should be handled on the policy side on the server, not decentralized on each runner
 
 ## Hooks
-- We will expose 2 variables that users can set to enable hooks  
+- We will expose variables that users can set to enable hooks
+  - `ACTIONS_RUNNER_HOOK_RUNNER_STARTED`
+  - `ACTIONS_RUNNER_HOOK_RUNNER_SHUTDOWN`
   - `ACTIONS_RUNNER_HOOK_JOB_STARTED`
   - `ACTIONS_RUNNER_HOOK_JOB_COMPLETED`
 
@@ -37,6 +39,8 @@ We want to ensure the experience for users invoking workflows is good, if hooks 
 - `Complete runner` 
 
 These steps will contain all of the output from invoking your hook, so you will have visibility into the runtime. We will also provide information on the path to the hook, and what shell we are invoking it as, much like we do for `run: ` steps.
+
+Runner startup and shutdown hooks run in the listener process, outside of a job, so their output is written to the runner terminal and diagnostic log instead of being added to a workflow step.
 
 ### Contexts
 When running your hooks, some context on your job may be helpful.
@@ -63,12 +67,15 @@ These are **synchronous** hooks, so they will block job execution while they are
 - There will be no support for `continue-on-error`
 
 ## Key Decisions
-- We will expose 2 variables that users can set to enable hooks  
+- We will expose variables that users can set to enable hooks
+  - `ACTIONS_RUNNER_HOOK_RUNNER_STARTED`
+  - `ACTIONS_RUNNER_HOOK_RUNNER_SHUTDOWN`
   - `ACTIONS_RUNNER_HOOK_JOB_STARTED`
   - `ACTIONS_RUNNER_HOOK_JOB_COMPLETED`
-- Users can set these variables to the path of a `.sh` or `.ps1` file, which we will execute when Jobs are started or completed.
-  - Output from these will be added to a new step at the start/end of a job named `Set up runner` or `Complete runner`. 
-    - These steps will only be generated on runs with these hooks
+- Users can set these variables to the path of a `.sh` or `.ps1` file, which we will execute when the runner starts or shuts down, or when jobs are started or completed.
+  - Output from job hooks will be added to a new step at the start/end of a job named `Set up runner` or `Complete runner`.
+    - These steps will only be generated on runs with job hooks
+  - Output from runner startup and shutdown hooks will be written to the runner terminal and diagnostic log.
 - These hooks `always()` execute if the env variable is set
 - These files will execute as the Runner user, outside of any container specification on the job
 - These are **synchronous** hooks

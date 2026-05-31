@@ -29,7 +29,10 @@ namespace GitHub.Runner.Common.Tests.Listener
         private Mock<ICredentialManager> _credentialManager;
         private Mock<IActionsRunServer> _actionsRunServer;
         private Mock<IRunServer> _runServer;
+        private Mock<IRunnerHookProvider> _runnerHookProvider;
         private readonly string _returnJobResultForHosted;
+        private readonly string _runnerStartedHookPath;
+        private readonly string _runnerShutdownHookPath;
 
         public RunnerL0()
         {
@@ -46,14 +49,21 @@ namespace GitHub.Runner.Common.Tests.Listener
             _credentialManager = new Mock<ICredentialManager>();
             _actionsRunServer = new Mock<IActionsRunServer>();
             _runServer = new Mock<IRunServer>();
+            _runnerHookProvider = new Mock<IRunnerHookProvider>();
 
             _returnJobResultForHosted = Environment.GetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED");
+            _runnerStartedHookPath = Environment.GetEnvironmentVariable(Constants.Hooks.RunnerStartedHookPath);
+            _runnerShutdownHookPath = Environment.GetEnvironmentVariable(Constants.Hooks.RunnerShutdownHookPath);
             Environment.SetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED", null);
+            Environment.SetEnvironmentVariable(Constants.Hooks.RunnerStartedHookPath, null);
+            Environment.SetEnvironmentVariable(Constants.Hooks.RunnerShutdownHookPath, null);
         }
 
         public void Dispose()
         {
             Environment.SetEnvironmentVariable("ACTIONS_RUNNER_RETURN_JOB_RESULT_FOR_HOSTED", _returnJobResultForHosted);
+            Environment.SetEnvironmentVariable(Constants.Hooks.RunnerStartedHookPath, _runnerStartedHookPath);
+            Environment.SetEnvironmentVariable(Constants.Hooks.RunnerShutdownHookPath, _runnerShutdownHookPath);
         }
 
         private Pipelines.AgentJobRequestMessage CreateJobRequestMessage(string jobName)
@@ -224,6 +234,88 @@ namespace GitHub.Runner.Common.Tests.Listener
                 await runner.ExecuteCommand(command);
 
                 _messageListener.Verify(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()), expectedTimes);
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async Task TestRunnerLifecycleHooks()
+        {
+            using (var hc = new TestHostContext(this))
+            {
+                hc.SetSingleton<IConfigurationManager>(_configurationManager.Object);
+                hc.SetSingleton<IPromptManager>(_promptManager.Object);
+                hc.SetSingleton<IMessageListener>(_messageListener.Object);
+                hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
+                hc.SetSingleton<IRunnerHookProvider>(_runnerHookProvider.Object);
+                hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
+
+                Environment.SetEnvironmentVariable(Constants.Hooks.RunnerStartedHookPath, "/foo/start");
+                Environment.SetEnvironmentVariable(Constants.Hooks.RunnerShutdownHookPath, "/foo/shutdown");
+
+                var command = new CommandSettings(hc, new string[] { "run" });
+
+                _configurationManager.Setup(x => x.IsConfigured()).Returns(true);
+                _configurationManager.Setup(x => x.LoadSettings())
+                    .Returns(new RunnerSettings { });
+
+                _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
+                _messageListener.Setup(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()))
+                    .Returns(Task.FromResult<CreateSessionResult>(CreateSessionResult.Failure));
+                _runnerHookProvider.Setup(x => x.RunHook("runner startup hook", "/foo/start", It.IsAny<CancellationToken>()))
+                    .Returns(Task.CompletedTask);
+                _runnerHookProvider.Setup(x => x.RunHook("runner shutdown hook", "/foo/shutdown", It.IsAny<CancellationToken>()))
+                    .Returns(Task.CompletedTask);
+
+                var runner = new Runner.Listener.Runner();
+                runner.Initialize(hc);
+                var result = await runner.ExecuteCommand(command);
+
+                Assert.Equal(Constants.Runner.ReturnCode.TerminatedError, result);
+                _runnerHookProvider.Verify(x => x.RunHook("runner startup hook", "/foo/start", It.IsAny<CancellationToken>()), Times.Once());
+                _runnerHookProvider.Verify(x => x.RunHook("runner shutdown hook", "/foo/shutdown", It.IsAny<CancellationToken>()), Times.Once());
+                _messageListener.Verify(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()), Times.Once());
+            }
+        }
+
+        [Fact]
+        [Trait("Level", "L0")]
+        [Trait("Category", "Runner")]
+        public async Task TestRunnerStartupHookFailureStopsRunner()
+        {
+            using (var hc = new TestHostContext(this))
+            {
+                hc.SetSingleton<IConfigurationManager>(_configurationManager.Object);
+                hc.SetSingleton<IPromptManager>(_promptManager.Object);
+                hc.SetSingleton<IMessageListener>(_messageListener.Object);
+                hc.SetSingleton<IConfigurationStore>(_configStore.Object);
+                hc.SetSingleton<IRunnerServer>(_runnerServer.Object);
+                hc.SetSingleton<IRunnerHookProvider>(_runnerHookProvider.Object);
+                hc.EnqueueInstance<IErrorThrottler>(_acquireJobThrottler.Object);
+
+                Environment.SetEnvironmentVariable(Constants.Hooks.RunnerStartedHookPath, "/foo/start");
+                Environment.SetEnvironmentVariable(Constants.Hooks.RunnerShutdownHookPath, "/foo/shutdown");
+
+                var command = new CommandSettings(hc, new string[] { "run" });
+
+                _configurationManager.Setup(x => x.IsConfigured()).Returns(true);
+                _configurationManager.Setup(x => x.LoadSettings())
+                    .Returns(new RunnerSettings { });
+
+                _configStore.Setup(x => x.IsServiceConfigured()).Returns(false);
+                _runnerHookProvider.Setup(x => x.RunHook("runner startup hook", "/foo/start", It.IsAny<CancellationToken>()))
+                    .ThrowsAsync(new Exception("hook failed"));
+
+                var runner = new Runner.Listener.Runner();
+                runner.Initialize(hc);
+                var result = await runner.ExecuteCommand(command);
+
+                Assert.Equal(Constants.Runner.ReturnCode.TerminatedError, result);
+                _runnerHookProvider.Verify(x => x.RunHook("runner startup hook", "/foo/start", It.IsAny<CancellationToken>()), Times.Once());
+                _runnerHookProvider.Verify(x => x.RunHook("runner shutdown hook", It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never());
+                _messageListener.Verify(x => x.CreateSessionAsync(It.IsAny<CancellationToken>()), Times.Never());
             }
         }
 

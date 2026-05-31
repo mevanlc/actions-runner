@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Security.Claims;
 using System.Security.Cryptography;
 using System.Text;
@@ -329,10 +330,10 @@ namespace GitHub.Runner.Listener
                     if (multiSettings?.Associations?.Count > 0)
                     {
                         bool anyEphemeral = multiSettings.Associations.Any(x => x.Ephemeral);
-                        return await ExecuteMultiRunnerAsync(multiSettings, command.RunOnce || anyEphemeral || returnJobResultForHosted, returnJobResultForHosted);
+                        return await ExecuteRunnerWithHooksAsync(() => ExecuteMultiRunnerAsync(multiSettings, command.RunOnce || anyEphemeral || returnJobResultForHosted, returnJobResultForHosted));
                     }
 
-                    return await ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral || returnJobResultForHosted, returnJobResultForHosted);
+                    return await ExecuteRunnerWithHooksAsync(() => ExecuteRunnerAsync(settings, command.RunOnce || settings.Ephemeral || returnJobResultForHosted, returnJobResultForHosted));
                 }
                 else
                 {
@@ -414,6 +415,56 @@ namespace GitHub.Runner.Listener
                 : new MessageListener(settings, credentialData, connectionDisplayName);
             listener.Initialize(HostContext);
             return listener;
+        }
+
+        private async Task<int> ExecuteRunnerWithHooksAsync(Func<Task<int>> runAsync)
+        {
+            if (!await TryRunRunnerHookAsync(Constants.Hooks.RunnerStartedHookPath, "runner startup hook", HostContext.RunnerShutdownToken))
+            {
+                return Constants.Runner.ReturnCode.TerminatedError;
+            }
+
+            int returnCode = Constants.Runner.ReturnCode.Success;
+            ExceptionDispatchInfo runnerException = null;
+            try
+            {
+                returnCode = await runAsync();
+            }
+            catch (Exception ex)
+            {
+                runnerException = ExceptionDispatchInfo.Capture(ex);
+            }
+
+            if (!await TryRunRunnerHookAsync(Constants.Hooks.RunnerShutdownHookPath, "runner shutdown hook", CancellationToken.None))
+            {
+                runnerException?.Throw();
+                return Constants.Runner.ReturnCode.TerminatedError;
+            }
+
+            runnerException?.Throw();
+            return returnCode;
+        }
+
+        private async Task<bool> TryRunRunnerHookAsync(string environmentVariable, string displayName, CancellationToken cancellationToken)
+        {
+            var hookPath = Environment.GetEnvironmentVariable(environmentVariable);
+            if (string.IsNullOrEmpty(hookPath))
+            {
+                return true;
+            }
+
+            try
+            {
+                var hookProvider = HostContext.GetService<IRunnerHookProvider>();
+                await hookProvider.RunHook(displayName, hookPath, cancellationToken);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Trace.Error(ex);
+                _term.WriteError($"The {displayName} at '{hookPath}' did not execute successfully: {ex.Message}");
+                return false;
+            }
         }
 
         //create worker manager, create message listener and start listening to the queue

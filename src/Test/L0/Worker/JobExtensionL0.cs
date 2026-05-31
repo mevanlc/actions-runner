@@ -409,8 +409,8 @@ namespace GitHub.Runner.Common.Tests.Worker
         [Trait("Category", "Worker")]
         public async Task EnsurePreAndPostHookStepsIfEnvExists()
         {
-            Environment.SetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_STARTED", "/foo/bar");
-            Environment.SetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_COMPLETED", "/bar/foo");
+            Environment.SetEnvironmentVariable(Constants.Hooks.JobStartedHookPath, "/foo/bar");
+            Environment.SetEnvironmentVariable(Constants.Hooks.JobCompletedHookPath, "/bar/foo");
             using (TestHostContext hc = CreateTestContext())
             {
                 var jobExtension = new JobExtension();
@@ -431,8 +431,8 @@ namespace GitHub.Runner.Common.Tests.Worker
                 Assert.Equal(Constants.Hooks.JobCompletedStepName, (_jobEc.PostJobSteps.Last() as JobExtensionRunner).DisplayName);
             }
 
-            Environment.SetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_STARTED", null);
-            Environment.SetEnvironmentVariable("ACTIONS_RUNNER_HOOK_JOB_COMPLETED", null);
+            Environment.SetEnvironmentVariable(Constants.Hooks.JobStartedHookPath, null);
+            Environment.SetEnvironmentVariable(Constants.Hooks.JobCompletedHookPath, null);
         }
 
         [Fact]
