@@ -467,6 +467,11 @@ namespace GitHub.Runner.Common.Tests.Worker
 
                     var stepsRunner = new StepsRunner();
                     hc.SetSingleton(new Mock<IDapDebugger>().Object);
+
+                    var bgCoordinator = new BackgroundStepCoordinator();
+                    bgCoordinator.Initialize(hc);
+                    hc.SetSingleton<IBackgroundStepCoordinator>(bgCoordinator);
+
                     stepsRunner.Initialize(hc);
 
                     await stepsRunner.RunAsync(_jobEc);
